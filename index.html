@@ -2,15 +2,17 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <title>Hair Color Demo — Body Segmentation</title>
+  <title>Hair Color Demo — MediaPipe BodySegmentation</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { margin:0; background:#0e0e10; color:#fff; font-family:system-ui; }
-    header { padding:12px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #222; flex-wrap: wrap; }
-    main { height:calc(100vh - 60px); position:relative; }
+    header { padding:10px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #222; flex-wrap:wrap; }
+    main { height:calc(100vh - 56px); position:relative; }
     #wrap { position:relative; width:100%; height:100%; }
     video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
     input[type="color"] { width:40px; height:32px; padding:0; border:none; background:transparent; }
+    .sep { width:1px; height:24px; background:#333; }
+    label { display:flex; align-items:center; gap:6px; }
     small { opacity:0.7 }
   </style>
   <!-- TFJS -->
@@ -21,11 +23,25 @@
 <body>
   <header>
     <button id="startBtn">Запустить камеру</button>
+
+    <label>Режим:
+      <select id="mode">
+        <option value="mask">Mask (debug)</option>
+        <option value="person">Person tint</option>
+        <option value="hair">Hair-only (heuristic)</option>
+      </select>
+    </label>
+
+    <span class="sep"></span>
+
     <label>Цвет: <input id="colorPicker" type="color" value="#ff3aa5"></label>
     <label>Интенсивность: <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85"></label>
-    <label>Порог тёмных волос: <input id="darkness" type="range" min="0" max="255" step="1" value="130"></label>
-    <small>Если блонд — подними «Порог тёмных волос» и/или снизь интенсивность.</small>
+
+    <label id="darknessWrap">Порог тёмных волос: <input id="darkness" type="range" min="0" max="255" step="1" value="130"></label>
+
+    <small>Подсказка: если блонд — подними «Порог тёмных волос» и/или снизь интенсивность.</small>
   </header>
+
   <main>
     <div id="wrap">
       <video id="video" autoplay playsinline muted></video>
@@ -38,8 +54,18 @@
     const canvas = document.getElementById('out');
     const ctx = canvas.getContext('2d', { willReadFrequently:true });
 
+    const ui = {
+      startBtn: document.getElementById('startBtn'),
+      mode: document.getElementById('mode'),
+      color: document.getElementById('colorPicker'),
+      strength: document.getElementById('strength'),
+      darkness: document.getElementById('darkness'),
+      darknessWrap: document.getElementById('darknessWrap')
+    };
+
     const state = {
       running: false,
+      mode: 'mask',
       color: [255, 58, 165],
       strength: 0.85,
       darkness: 130,
@@ -55,9 +81,8 @@
       const model = bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation;
       state.segmenter = await bodySegmentation.createSegmenter(model, {
         runtime: 'mediapipe',
-        // CDN с файлами MediaPipe
         solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation',
-        modelType: 'landscape' // или 'general' — попробуй оба, landscape часто стабильнее для фронталки
+        modelType: 'landscape' // попробуй 'general' если будет лучше
       });
     }
 
@@ -69,6 +94,7 @@
       video.srcObject = stream;
       await new Promise(res => video.onloadedmetadata = res);
 
+      // размеры
       canvas.width = video.videoWidth || 1280;
       canvas.height = video.videoHeight || 720;
 
@@ -76,13 +102,35 @@
       requestAnimationFrame(loop);
     }
 
-    // Перекраска: ограничиваемся зоной головы (верхние ~60%),
-    // затем берём только тёмные пиксели внутри маски человека (прибл. волосы).
-    function tintHair(imageData, maskData, color, strength, darkness) {
-      const data = imageData.data;
-      const m = maskData.data; // RGBA маска: белое там, где человек
-      const w = imageData.width, h = imageData.height;
+    // == Режим 1: показать бинарную маску (debug) ==
+    function drawMask(maskImageData) {
+      ctx.putImageData(maskImageData, 0, 0);
+    }
 
+    // == Режим 2: перекрасить ВСЕ пиксели человека ==
+    function tintPerson(frame, mask, color, strength) {
+      const data = frame.data;
+      const m = mask.data;
+      const [cr, cg, cb] = color;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const person = m[i] > 200; // белый=человек
+        if (!person) continue;
+        const a = strength;
+        data[i]   = Math.round(data[i]*(1-a) + cr*a);
+        data[i+1] = Math.round(data[i+1]*(1-a) + cg*a);
+        data[i+2] = Math.round(data[i+2]*(1-a) + cb*a);
+      }
+      return frame;
+    }
+
+    // == Режим 3: перекрасить только волосы (эвристика) ==
+    function tintHair(frame, mask, color, strength, darkness) {
+      const data = frame.data;
+      const m = mask.data;
+      const w = frame.width, h = frame.height;
+
+      // ограничиваемся верхней частью, чтобы не красить бороду/одежду
       const headTop = 0;
       const headBottom = Math.floor(h * 0.62);
 
@@ -92,12 +140,11 @@
         for (let x = 0; x < w; x++) {
           const i = (y * w + x) * 4;
 
-          const person = m[i] > 200; // в маске белый=255 => человек
+          const person = m[i] > 200;
           if (!person) continue;
 
           const r = data[i], g = data[i+1], b = data[i+2];
-          // яркость для отсечения светлых участков (кожа/фон)
-          const lum = 0.2126*r + 0.7152*g + 0.0722*b;
+          const lum = 0.2126*r + 0.7152*g + 0.0722*b; // яркость
           if (lum < darkness) {
             const a = strength;
             data[i]   = Math.round(r*(1-a) + cr*a);
@@ -106,51 +153,58 @@
           }
         }
       }
-      return imageData;
+      return frame;
     }
 
     async function loop() {
       if (!state.running) return;
 
-      // 1) Рисуем исходный кадр
+      // 1) исходный кадр
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-      // 2) Сегментация (получим маску человека)
+      // 2) сегментация
       const people = await state.segmenter.segmentPeople(video, { flipHorizontal: true });
       if (!people || !people.length) {
         requestAnimationFrame(loop);
         return;
       }
 
-      // 3) Соберём из mask значение RGBA (255 там где человек)
-      // people[0].mask — ImageData-like (или HTMLCanvasElement), используем util:
+      // 3) получаем бинарную маску как ImageData
       const mask = await bodySegmentation.toBinaryMask(
-        people,                   // список людей
-        {r:255, g:255, b:255, a:255}, // цвет человека
-        {r:0, g:0, b:0, a:255},       // фон
-        true,                        // smooth — сгладить
-        0.7                          // opacity — неважно, мы читаем пиксели
+        people,
+        {r:255, g:255, b:255, a:255}, // человек = белый
+        {r:0, g:0, b:0, a:255},       // фон = чёрный
+        true,                         // сгладить
+        1.0                           // непрозрачность (нам важно значение RGB)
       );
 
-      // 4) Применяем окраску к предполагаемым волосам
-      const tinted = tintHair(frame, mask, state.color, state.strength, state.darkness);
-      ctx.putImageData(tinted, 0, 0);
+      // 4) визуализация по режиму
+      if (state.mode === 'mask') {
+        drawMask(mask);
+      } else if (state.mode === 'person') {
+        const tinted = tintPerson(frame, mask, state.color, state.strength);
+        ctx.putImageData(tinted, 0, 0);
+      } else { // 'hair'
+        const tinted = tintHair(frame, mask, state.color, state.strength, state.darkness);
+        ctx.putImageData(tinted, 0, 0);
+      }
 
       requestAnimationFrame(loop);
     }
 
-    // UI
-    document.getElementById('startBtn').addEventListener('click', start);
-    document.getElementById('colorPicker').addEventListener('input', (e) => {
-      state.color = hexToRgb(e.target.value);
+    // UI bindings
+    ui.startBtn.addEventListener('click', start);
+    ui.mode.addEventListener('change', (e) => {
+      state.mode = e.target.value;
+      ui.darknessWrap.style.display = state.mode === 'hair' ? 'flex' : 'none';
     });
-    document.getElementById('strength').addEventListener('input', (e) => {
-      state.strength = parseFloat(e.target.value);
-    });
-    document.getElementById('darkness').addEventListener('input', (e) => {
-      state.darkness = parseInt(e.target.value, 10);
-    });
+    ui.color.addEventListener('input', (e) => state.color = hexToRgb(e.target.value));
+    ui.strength.addEventListener('input', (e) => state.strength = parseFloat(e.target.value));
+    ui.darkness.addEventListener('input', (e) => state.darkness = parseInt(e.target.value, 10));
+
+    // стартовые настройки
+    ui.darknessWrap.style.display = 'none';
   </script>
 </body>
 </html>
