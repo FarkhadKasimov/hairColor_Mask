@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Hair Color Demo — TF.js</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { margin:0; background:#0e0e10; color:#fff; font-family:system-ui; }
+    header { padding:12px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #222; }
+    main { display:grid; grid-template-columns: 1fr; height:calc(100vh - 60px); }
+    #wrap { position:relative; width:100%; height:100%; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+    .row { display:flex; align-items:center; gap:8px; }
+    input[type="color"] { width:40px; height:32px; padding:0; border:none; background:transparent; }
+    small { opacity:0.7 }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/selfie-segmentation"></script>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <button id="startBtn">Запустить камеру</button>
+      <label>Цвет: <input id="colorPicker" type="color" value="#ff3aa5"></label>
+      <label>Интенсивность: <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85"></label>
+      <label>Порог тёмных волос: <input id="darkness" type="range" min="0" max="255" step="1" value="110"></label>
+    </div>
+    <small>Прототип без SDK: сегментация + эвристика «тёмные пиксели в области головы»</small>
+  </header>
+  <main>
+    <div id="wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="out"></canvas>
+    </div>
+  </main>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('out');
+    const ctx = canvas.getContext('2d', { willReadFrequently:true });
+
+    const state = {
+      running: false,
+      color: [255, 58, 165],
+      strength: 0.85,
+      darkness: 110,
+      model: null,
+    };
+
+    function hexToRgb(hex) {
+      const v = hex.replace('#','');
+      return [parseInt(v.slice(0,2),16), parseInt(v.slice(2,4),16), parseInt(v.slice(4,6),16)];
+    }
+
+    async function start() {
+      if (state.running) return;
+      state.running = true;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio:false });
+      video.srcObject = stream;
+
+      await new Promise(res => video.onloadedmetadata = res);
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      // Загрузка модели SelfieSegmentation (tfjs-модель из @tensorflow-models/selfie-segmentation)
+      state.model = await selfieSegmentation.SelfieSegmentation.load({
+        modelUrl: 'https://storage.googleapis.com/tfjs-models/savedmodel/selfie_segmentation/model.json', // публичный хост модели
+        internalResolution: 'medium'
+      });
+
+      requestAnimationFrame(loop);
+    }
+
+    function applyColorToHair(imageData, maskData, color, strength, darkness) {
+      const data = imageData.data;
+      const m = maskData.data; // RGBA (мы нарисуем туда ч/б маску)
+
+      // предполагаем, что маска = белый там, где есть человек
+      // чтобы найти волосы: возьмем только верхнюю половину головы (~ верхняя 1/3 кадра) + тёмные пиксели
+      const w = imageData.width, h = imageData.height;
+      const headTop = 0, headBottom = Math.floor(h * 0.6);
+
+      const [cr, cg, cb] = color;
+      for (let y = headTop; y < headBottom; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+
+          // внутри человека?
+          const person = m[i] > 200; // т.к. мы рисуем маску белым=255
+
+          if (!person) continue;
+
+          const r = data[i], g = data[i+1], b = data[i+2];
+          const lum = 0.2126*r + 0.7152*g + 0.0722*b;
+
+          // тёмные пиксели — вероятнее волосы
+          if (lum < darkness) {
+            // простое смешивание: original * (1 - a) + tint * a
+            const a = strength;
+            data[i]   = Math.round(r*(1-a) + cr*a);
+            data[i+1] = Math.round(g*(1-a) + cg*a);
+            data[i+2] = Math.round(b*(1-a) + cb*a);
+          }
+        }
+      }
+      return imageData;
+    }
+
+    async function loop() {
+      if (!state.running) return;
+
+      // исходное изображение
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // сегментация человека
+      const seg = await state.model.segmentPeople(video, { flipHorizontal: true });
+      // подготовим маску (чёрно-белую) по первому человеку
+      const maskCanvas = new OffscreenCanvas(canvas.width, canvas.height);
+      const mctx = maskCanvas.getContext('2d');
+      const maskImage = mctx.createImageData(canvas.width, canvas.height);
+      const md = maskImage.data;
+
+      if (seg && seg.length) {
+        const person = seg[0]; // самый крупный
+        const mask = person.segmentationMask; // Uint8Array 0/1
+        for (let i=0, p=0; i<mask.length; i++, p+=4) {
+          const v = mask[i] ? 255 : 0;
+          md[p] = md[p+1] = md[p+2] = v;
+          md[p+3] = 255;
+        }
+      } else {
+        // нет человека — просто перерисуем и продолжим
+        requestAnimationFrame(loop);
+        return;
+      }
+      mctx.putImageData(maskImage, 0, 0);
+
+      // применяем перекраску к предполагаемым волосам
+      const tinted = applyColorToHair(frame, maskImage, state.color, state.strength, state.darkness);
+      ctx.putImageData(tinted, 0, 0);
+
+      requestAnimationFrame(loop);
+    }
+
+    // UI
+    document.getElementById('startBtn').addEventListener('click', start);
+    document.getElementById('colorPicker').addEventListener('input', (e) => {
+      state.color = hexToRgb(e.target.value);
+    });
+    document.getElementById('strength').addEventListener('input', (e) => {
+      state.strength = parseFloat(e.target.value);
+    });
+    document.getElementById('darkness').addEventListener('input', (e) => {
+      state.darkness = parseInt(e.target.value, 10);
+    });
+  </script>
+</body>
+</html>
