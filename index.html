@@ -1,210 +1,313 @@
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8" />
-  <title>Hair Color Demo — MediaPipe BodySegmentation</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <title>Hair Recolor — ONNX Runtime Web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body { margin:0; background:#0e0e10; color:#fff; font-family:system-ui; }
-    header { padding:10px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #222; flex-wrap:wrap; }
-    main { height:calc(100vh - 56px); position:relative; }
+    :root { color-scheme: dark; }
+    body { margin:0; background:#0e0e10; color:#fff; font-family:system-ui, sans-serif; }
+    header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px; border-bottom:1px solid #222; }
+    main { position:relative; height:calc(100vh - 60px); }
     #wrap { position:relative; width:100%; height:100%; }
     video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
-    input[type="color"] { width:40px; height:32px; padding:0; border:none; background:transparent; }
     .sep { width:1px; height:24px; background:#333; }
-    label { display:flex; align-items:center; gap:6px; }
-    small { opacity:0.7 }
+    input[type="color"] { width:40px; height:32px; padding:0; border:none; background:transparent; }
+    small { opacity:0.75 }
   </style>
-  <!-- TFJS -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
-  <!-- Body Segmentation -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@0.1.3/dist/body-segmentation.min.js"></script>
+  <!-- ONNX Runtime Web -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
 </head>
 <body>
-  <header>
-    <button id="startBtn">Запустить камеру</button>
+<header>
+  <button id="startBtn">Запустить камеру</button>
+  <label>Режим:
+    <select id="mode">
+      <option value="hair">Hair only</option>
+      <option value="person">Whole face/person (debug)</option>
+      <option value="mask">Show mask (debug)</option>
+    </select>
+  </label>
+  <span class="sep"></span>
+  <label>Цвет: <input id="colorPicker" type="color" value="#ff3aa5"></label>
+  <label>Интенсивность: <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85"></label>
+  <small id="log"></small>
+</header>
 
-    <label>Режим:
-      <select id="mode">
-        <option value="mask">Mask (debug)</option>
-        <option value="person">Person tint</option>
-        <option value="hair">Hair-only (heuristic)</option>
-      </select>
-    </label>
+<main>
+  <div id="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="out"></canvas>
+  </div>
+</main>
 
-    <span class="sep"></span>
+<script>
+/** =======================
+ *  CONFIG — под себя
+ *  ======================= */
+// Положи модель сюда и укажи путь:
+const MODEL_URL = './models/face_parsing_bisenet_512.onnx';
 
-    <label>Цвет: <input id="colorPicker" type="color" value="#ff3aa5"></label>
-    <label>Интенсивность: <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85"></label>
+// Настройки модели (типичный BiSeNet Face Parsing 19-классов)
+const MODEL_CFG = {
+  inputShape: [1, 3, 512, 512],     // NCHW
+  outputChannels: 19,               // кол-во классов на выходе
+  hairClassId: 17,                  // ID класса "Hair" (часто 17; иногда 13 — если не будет маски, попробуй 13)
+  mean: [0.485, 0.456, 0.406],      // стандартная нормализация
+  std:  [0.229, 0.224, 0.225],
+  useBGR: false                     // если твоя модель требует BGR — поставь true
+};
 
-    <label id="darknessWrap">Порог тёмных волос: <input id="darkness" type="range" min="0" max="255" step="1" value="130"></label>
+// Если у твоей модели другие имена входа/выхода — можешь указать явно:
+let FORCE_INPUT_NAME = null;   // например 'input'
+let FORCE_OUTPUT_NAME = null;  // например 'output'
 
-    <small>Подсказка: если блонд — подними «Порог тёмных волос» и/или снизь интенсивность.</small>
-  </header>
+/** =======================
+ *  DOM & State
+ *  ======================= */
+const els = {
+  start: document.getElementById('startBtn'),
+  mode: document.getElementById('mode'),
+  color: document.getElementById('colorPicker'),
+  strength: document.getElementById('strength'),
+  log: document.getElementById('log'),
+  video: document.getElementById('video'),
+  canvas: document.getElementById('out'),
+};
+const ctx = els.canvas.getContext('2d');
 
-  <main>
-    <div id="wrap">
-      <video id="video" autoplay playsinline muted></video>
-      <canvas id="out"></canvas>
-    </div>
-  </main>
+const state = {
+  session: null,
+  running: false,
+  inputName: null,
+  outputName: null,
+  tintRGB: [255,58,165],
+  strength: 0.85,
+  mode: 'hair',
+};
 
-  <script>
-    const video = document.getElementById('video');
-    const canvas = document.getElementById('out');
-    const ctx = canvas.getContext('2d', { willReadFrequently:true });
+/** =======================
+ *  Utils
+ *  ======================= */
+function log(s){ els.log.textContent = s; console.info('[hair]', s); }
+function hexToRgb(hex) {
+  const v = hex.replace('#','');
+  return [parseInt(v.slice(0,2),16), parseInt(v.slice(2,4),16), parseInt(v.slice(4,6),16)];
+}
+function createCanvas(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
 
-    const ui = {
-      startBtn: document.getElementById('startBtn'),
-      mode: document.getElementById('mode'),
-      color: document.getElementById('colorPicker'),
-      strength: document.getElementById('strength'),
-      darkness: document.getElementById('darkness'),
-      darknessWrap: document.getElementById('darknessWrap')
-    };
+/** =======================
+ *  Init camera
+ *  ======================= */
+async function startCamera(){
+  const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:false });
+  els.video.srcObject = stream;
+  await new Promise(res => els.video.onloadedmetadata = res);
+  els.canvas.width = els.video.videoWidth || 1280;
+  els.canvas.height = els.video.videoHeight || 720;
+}
 
-    const state = {
-      running: false,
-      mode: 'mask',
-      color: [255, 58, 165],
-      strength: 0.85,
-      darkness: 130,
-      segmenter: null
-    };
-
-    function hexToRgb(hex) {
-      const v = hex.replace('#','');
-      return [parseInt(v.slice(0,2),16), parseInt(v.slice(2,4),16), parseInt(v.slice(4,6),16)];
-    }
-
-    async function setupSegmenter() {
-      const model = bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation;
-      state.segmenter = await bodySegmentation.createSegmenter(model, {
-        runtime: 'mediapipe',
-        solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation',
-        modelType: 'landscape' // попробуй 'general' если будет лучше
+/** =======================
+ *  Load ONNX model
+ *  ======================= */
+async function loadModel(){
+  try {
+    // сначала пытаемся webgl, если нет — wasm
+    try{
+      state.session = await ort.InferenceSession.create(MODEL_URL, {
+        executionProviders: ['webgl'], graphOptimizationLevel: 'all'
       });
+      log('ONNX loaded (webgl)');
+    } catch(e) {
+      console.warn('webgl EP failed, fallback to wasm', e);
+      state.session = await ort.InferenceSession.create(MODEL_URL, {
+        executionProviders: ['wasm'], graphOptimizationLevel: 'all'
+      });
+      log('ONNX loaded (wasm)');
     }
 
-    async function start() {
-      if (state.running) return;
-      state.running = true;
+    // Имена входа/выхода
+    const inputs  = state.session.inputNames  || [];
+    const outputs = state.session.outputNames || [];
+    state.inputName  = FORCE_INPUT_NAME  || inputs[0]  || 'input';
+    state.outputName = FORCE_OUTPUT_NAME || outputs[0] || 'output';
+    log(`I/O: ${state.inputName} → ${state.outputName}`);
+  } catch(err){
+    console.error(err); log('Не удалось загрузить модель'); throw err;
+  }
+}
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio:false });
-      video.srcObject = stream;
-      await new Promise(res => video.onloadedmetadata = res);
+/** =======================
+ *  Preprocess frame -> Tensor
+ *  ======================= */
+function preprocessToTensor(video){
+  const [N,C,H,W] = MODEL_CFG.inputShape;
+  // рисуем в маленький буфер модели
+  const inCanvas = createCanvas(W,H);
+  const inCtx = inCanvas.getContext('2d', {willReadFrequently:true});
+  inCtx.drawImage(video, 0, 0, W, H);
+  const img = inCtx.getImageData(0,0,W,H).data;
 
-      // размеры
-      canvas.width = video.videoWidth || 1280;
-      canvas.height = video.videoHeight || 720;
+  // RGBA -> Float32 NCHW (normalize)
+  const data = new Float32Array(N*C*H*W);
+  const [mr, mg, mb] = MODEL_CFG.mean;
+  const [sr, sg, sb] = MODEL_CFG.std;
 
-      await setupSegmenter();
-      requestAnimationFrame(loop);
-    }
+  // Чтение быстрее по каналам сразу в плоскости
+  const plane = W*H;
+  for(let y=0, i=0; y<H; y++){
+    for(let x=0; x<W; x++, i++){
+      const p = (y*W + x)*4;
+      const r = img[p]/255, g = img[p+1]/255, b = img[p+2]/255;
 
-    // == Режим 1: показать бинарную маску (debug) ==
-    function drawMask(maskImageData) {
-      ctx.putImageData(maskImageData, 0, 0);
-    }
+      const R = (r - mr)/sr;
+      const G = (g - mg)/sg;
+      const B = (b - mb)/sb;
 
-    // == Режим 2: перекрасить ВСЕ пиксели человека ==
-    function tintPerson(frame, mask, color, strength) {
-      const data = frame.data;
-      const m = mask.data;
-      const [cr, cg, cb] = color;
-
-      for (let i = 0; i < data.length; i += 4) {
-        const person = m[i] > 200; // белый=человек
-        if (!person) continue;
-        const a = strength;
-        data[i]   = Math.round(data[i]*(1-a) + cr*a);
-        data[i+1] = Math.round(data[i+1]*(1-a) + cg*a);
-        data[i+2] = Math.round(data[i+2]*(1-a) + cb*a);
+      if (MODEL_CFG.useBGR){
+        data[0*plane + i] = B;
+        data[1*plane + i] = G;
+        data[2*plane + i] = R;
+      } else {
+        data[0*plane + i] = R;
+        data[1*plane + i] = G;
+        data[2*plane + i] = B;
       }
-      return frame;
     }
+  }
+  return new ort.Tensor('float32', data, [N,C,H,W]);
+}
 
-    // == Режим 3: перекрасить только волосы (эвристика) ==
-    function tintHair(frame, mask, color, strength, darkness) {
-      const data = frame.data;
-      const m = mask.data;
-      const w = frame.width, h = frame.height;
-
-      // ограничиваемся верхней частью, чтобы не красить бороду/одежду
-      const headTop = 0;
-      const headBottom = Math.floor(h * 0.62);
-
-      const [cr, cg, cb] = color;
-
-      for (let y = headTop; y < headBottom; y++) {
-        for (let x = 0; x < w; x++) {
-          const i = (y * w + x) * 4;
-
-          const person = m[i] > 200;
-          if (!person) continue;
-
-          const r = data[i], g = data[i+1], b = data[i+2];
-          const lum = 0.2126*r + 0.7152*g + 0.0722*b; // яркость
-          if (lum < darkness) {
-            const a = strength;
-            data[i]   = Math.round(r*(1-a) + cr*a);
-            data[i+1] = Math.round(g*(1-a) + cg*a);
-            data[i+2] = Math.round(b*(1-a) + cb*a);
-          }
-        }
-      }
-      return frame;
+/** =======================
+ *  Argmax over channels
+ *  (assumes output [1, C, H, W])
+ *  ======================= */
+function argmaxChannels(tensor, C, H, W){
+  const src = tensor.data; // Float32Array
+  const pixels = H*W;
+  const cls = new Uint8Array(pixels);
+  for(let i=0; i<pixels; i++){
+    let best = -1e9, idx = 0;
+    for(let c=0; c<C; c++){
+      const v = src[c*pixels + i];
+      if (v > best){ best = v; idx = c; }
     }
+    cls[i] = idx;
+  }
+  return cls;
+}
 
-    async function loop() {
-      if (!state.running) return;
+/** =======================
+ *  Build hair mask canvas (video-sized)
+ *  ======================= */
+function buildHairMaskCanvas(classMap, H, W, videoW, videoH){
+  // 1) маленькая маска (H×W) в альфу
+  const small = createCanvas(W,H);
+  const sctx = small.getContext('2d');
+  const id = sctx.createImageData(W,H);
+  const hairId = MODEL_CFG.hairClassId;
+  const d = id.data;
+  for(let i=0; i<classMap.length; i++){
+    const isHair = (classMap[i] === hairId);
+    const a = isHair ? 255 : 0;
+    const p = i*4;
+    d[p]=255; d[p+1]=255; d[p+2]=255; d[p+3]=a; // белая маска в альфе
+  }
+  sctx.putImageData(id, 0, 0);
 
-      // 1) исходный кадр
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  // 2) апскейлим до размера видео
+  const mask = createCanvas(videoW, videoH);
+  const mctx = mask.getContext('2d');
+  mctx.imageSmoothingEnabled = true;
+  mctx.drawImage(small, 0, 0, videoW, videoH);
+  return mask;
+}
 
-      // 2) сегментация
-      const people = await state.segmenter.segmentPeople(video, { flipHorizontal: true });
-      if (!people || !people.length) {
-        requestAnimationFrame(loop);
-        return;
-      }
+/** =======================
+ *  Composite: video + tint*mask
+ *  без поканального CPU-цикла
+ *  ======================= */
+function compositeTint(maskCanvas){
+  const [r,g,b] = state.tintRGB;
+  const a = state.strength;
 
-      // 3) получаем бинарную маску как ImageData
-      const mask = await bodySegmentation.toBinaryMask(
-        people,
-        {r:255, g:255, b:255, a:255}, // человек = белый
-        {r:0, g:0, b:0, a:255},       // фон = чёрный
-        true,                         // сгладить
-        1.0                           // непрозрачность (нам важно значение RGB)
-      );
+  // 1) рисуем исходный кадр уже сделан в ctx.drawImage(video) раньше
+  // 2) готовим цветной оверлей в отдельном канвасе
+  const W = els.canvas.width, H = els.canvas.height;
+  const overlay = createCanvas(W,H);
+  const octx = overlay.getContext('2d');
 
-      // 4) визуализация по режиму
-      if (state.mode === 'mask') {
-        drawMask(mask);
-      } else if (state.mode === 'person') {
-        const tinted = tintPerson(frame, mask, state.color, state.strength);
-        ctx.putImageData(tinted, 0, 0);
-      } else { // 'hair'
-        const tinted = tintHair(frame, mask, state.color, state.strength, state.darkness);
-        ctx.putImageData(tinted, 0, 0);
-      }
+  octx.fillStyle = `rgba(${r},${g},${b},${a})`;
+  octx.fillRect(0,0,W,H);
 
-      requestAnimationFrame(loop);
-    }
+  // 3) вырезаем по маске (оставляем цвет только в пикселях волос)
+  octx.globalCompositeOperation = 'destination-in';
+  octx.drawImage(maskCanvas, 0, 0, W, H);
+  octx.globalCompositeOperation = 'source-over';
 
-    // UI bindings
-    ui.startBtn.addEventListener('click', start);
-    ui.mode.addEventListener('change', (e) => {
-      state.mode = e.target.value;
-      ui.darknessWrap.style.display = state.mode === 'hair' ? 'flex' : 'none';
-    });
-    ui.color.addEventListener('input', (e) => state.color = hexToRgb(e.target.value));
-    ui.strength.addEventListener('input', (e) => state.strength = parseFloat(e.target.value));
-    ui.darkness.addEventListener('input', (e) => state.darkness = parseInt(e.target.value, 10));
+  // 4) кладём поверх основного
+  ctx.drawImage(overlay, 0, 0, W, H);
+}
 
-    // стартовые настройки
-    ui.darknessWrap.style.display = 'none';
-  </script>
+/** =======================
+ *  Main loop
+ *  ======================= */
+async function loop(){
+  if (!state.running) return;
+
+  // отрисовали кадр камеры
+  ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
+
+  // препроцесс
+  const input = preprocessToTensor(els.video);
+
+  // инференс
+  const feeds = {}; feeds[state.inputName] = input;
+  const outMap = await state.session.run(feeds);
+  const out = outMap[state.outputName];
+
+  // ожидаем [1, C, H, W]; если у тебя NHWC — нужно будет адаптировать
+  const C = MODEL_CFG.outputChannels;
+  const H = MODEL_CFG.inputShape[2];
+  const W = MODEL_CFG.inputShape[3];
+
+  const classes = argmaxChannels(out, C, H, W);
+  const maskCanvas = buildHairMaskCanvas(classes, H, W, els.canvas.width, els.canvas.height);
+
+  const mode = state.mode;
+  if (mode === 'mask'){
+    // просто показать маску
+    ctx.drawImage(maskCanvas, 0, 0);
+  } else if (mode === 'person'){
+    // закрасим весь детектируемый класс != 0 (грубый дебаг, чаще всего кожа/фон)
+    // Быстрый вариант: используем уже построенную маску волос, но для дебага
+    compositeTint(maskCanvas); // тут красится только hair; для whole-person нужен person-модель/класс
+  } else {
+    // красим только волосы
+    compositeTint(maskCanvas);
+  }
+
+  requestAnimationFrame(loop);
+}
+
+/** =======================
+ *  UI
+ *  ======================= */
+els.start.addEventListener('click', async () => {
+  els.start.disabled = true;
+  try {
+    await startCamera();
+    await loadModel();
+    state.running = true;
+    requestAnimationFrame(loop);
+  } catch(e){
+    els.start.disabled = false;
+  }
+});
+
+els.mode.addEventListener('change', e => state.mode = e.target.value);
+els.color.addEventListener('input', e => state.tintRGB = hexToRgb(e.target.value));
+els.strength.addEventListener('input', e => state.strength = parseFloat(e.target.value));
+</script>
 </body>
 </html>
