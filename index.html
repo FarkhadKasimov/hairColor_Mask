@@ -1,313 +1,225 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8"/>
-  <title>Hair Recolor — ONNX Runtime Web</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta charset="utf-8" />
+  <title>Hair Color Demo — MediaPipe</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; background:#0e0e10; color:#fff; font-family:system-ui, sans-serif; }
-    header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px; border-bottom:1px solid #222; }
-    main { position:relative; height:calc(100vh - 60px); }
-    #wrap { position:relative; width:100%; height:100%; }
-    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
-    .sep { width:1px; height:24px; background:#333; }
-    input[type="color"] { width:40px; height:32px; padding:0; border:none; background:transparent; }
-    small { opacity:0.75 }
+    body { margin:0; background:#0e0e10; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    header { padding:12px 16px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #1f1f22; }
+    header h1 { font-size:16px; margin:0; font-weight:600; opacity:.9; }
+    .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-left:auto; }
+    .controls label { display:flex; align-items:center; gap:8px; font-size:14px; opacity:.9; }
+    .controls input[type="color"] { width:36px; height:28px; border:0; background:transparent; }
+    .controls input[type="range"] { width:160px; }
+    main { display:grid; place-items:center; height:calc(100vh - 58px); padding:10px; }
+    canvas { width:min(92vw, 960px); height:auto; background:#000; border-radius:14px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .row { display:flex; gap:12px; align-items:center; }
+    .note { font-size:12px; opacity:.7; }
+    button { background:#1f6feb; color:#fff; border:0; border-radius:10px; padding:8px 12px; cursor:pointer; font-weight:600; }
+    button:disabled { opacity:.5; cursor:default; }
+    select { background:#151518; color:#fff; border:1px solid #2a2a31; border-radius:10px; padding:6px 10px; }
   </style>
-  <!-- ONNX Runtime Web -->
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+  <!-- MediaPipe Tasks (vision) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js"></script>
 </head>
 <body>
-<header>
-  <button id="startBtn">Запустить камеру</button>
-  <label>Режим:
-    <select id="mode">
-      <option value="hair">Hair only</option>
-      <option value="person">Whole face/person (debug)</option>
-      <option value="mask">Show mask (debug)</option>
-    </select>
-  </label>
-  <span class="sep"></span>
-  <label>Цвет: <input id="colorPicker" type="color" value="#ff3aa5"></label>
-  <label>Интенсивность: <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85"></label>
-  <small id="log"></small>
-</header>
+  <header>
+    <h1>Hair Color — MediaPipe (WebCam)</h1>
+    <div class="controls">
+      <label>Цвет
+        <input id="color" type="color" value="#ff3366" />
+      </label>
+      <label>Интенсивность
+        <input id="strength" type="range" min="0" max="1" step="0.01" value="0.8" />
+      </label>
+      <label>Смягчение края
+        <input id="feather" type="range" min="0" max="12" step="0.5" value="4" />
+      </label>
+      <label>Блендинг
+        <select id="blend">
+          <option value="color">color</option>
+          <option value="soft-light">soft-light</option>
+          <option value="multiply">multiply</option>
+          <option value="overlay">overlay</option>
+          <option value="screen">screen</option>
+        </select>
+      </label>
+      <button id="snap">Сохранить кадр</button>
+    </div>
+  </header>
 
-<main>
-  <div id="wrap">
-    <video id="video" autoplay playsinline muted></video>
-    <canvas id="out"></canvas>
-  </div>
-</main>
+  <main>
+    <canvas id="out" width="960" height="540"></canvas>
+  </main>
 
-<script>
-/** =======================
- *  CONFIG — под себя
- *  ======================= */
-// Положи модель сюда и укажи путь:
-const MODEL_URL = './models/face_parsing_bisenet_512.onnx';
+  <video id="video" playsinline autoplay muted style="display:none"></video>
+  <canvas id="mask" width="960" height="540" style="display:none"></canvas>
 
-// Настройки модели (типичный BiSeNet Face Parsing 19-классов)
-const MODEL_CFG = {
-  inputShape: [1, 3, 512, 512],     // NCHW
-  outputChannels: 19,               // кол-во классов на выходе
-  hairClassId: 17,                  // ID класса "Hair" (часто 17; иногда 13 — если не будет маски, попробуй 13)
-  mean: [0.485, 0.456, 0.406],      // стандартная нормализация
-  std:  [0.229, 0.224, 0.225],
-  useBGR: false                     // если твоя модель требует BGR — поставь true
-};
+  <script>
+    (async () => {
+      const video = document.getElementById('video');
+      const out = document.getElementById('out');
+      const maskCanvas = document.getElementById('mask');
 
-// Если у твоей модели другие имена входа/выхода — можешь указать явно:
-let FORCE_INPUT_NAME = null;   // например 'input'
-let FORCE_OUTPUT_NAME = null;  // например 'output'
+      const ctx = out.getContext('2d', { willReadFrequently: false });
+      const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
 
-/** =======================
- *  DOM & State
- *  ======================= */
-const els = {
-  start: document.getElementById('startBtn'),
-  mode: document.getElementById('mode'),
-  color: document.getElementById('colorPicker'),
-  strength: document.getElementById('strength'),
-  log: document.getElementById('log'),
-  video: document.getElementById('video'),
-  canvas: document.getElementById('out'),
-};
-const ctx = els.canvas.getContext('2d');
+      const colorInput   = document.getElementById('color');
+      const strengthInput= document.getElementById('strength');
+      const featherInput = document.getElementById('feather');
+      const blendSelect  = document.getElementById('blend');
+      const snapBtn      = document.getElementById('snap');
 
-const state = {
-  session: null,
-  running: false,
-  inputName: null,
-  outputName: null,
-  tintRGB: [255,58,165],
-  strength: 0.85,
-  mode: 'hair',
-};
-
-/** =======================
- *  Utils
- *  ======================= */
-function log(s){ els.log.textContent = s; console.info('[hair]', s); }
-function hexToRgb(hex) {
-  const v = hex.replace('#','');
-  return [parseInt(v.slice(0,2),16), parseInt(v.slice(2,4),16), parseInt(v.slice(4,6),16)];
-}
-function createCanvas(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
-
-/** =======================
- *  Init camera
- *  ======================= */
-async function startCamera(){
-  const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:false });
-  els.video.srcObject = stream;
-  await new Promise(res => els.video.onloadedmetadata = res);
-  els.canvas.width = els.video.videoWidth || 1280;
-  els.canvas.height = els.video.videoHeight || 720;
-}
-
-/** =======================
- *  Load ONNX model
- *  ======================= */
-async function loadModel(){
-  try {
-    // сначала пытаемся webgl, если нет — wasm
-    try{
-      state.session = await ort.InferenceSession.create(MODEL_URL, {
-        executionProviders: ['webgl'], graphOptimizationLevel: 'all'
-      });
-      log('ONNX loaded (webgl)');
-    } catch(e) {
-      console.warn('webgl EP failed, fallback to wasm', e);
-      state.session = await ort.InferenceSession.create(MODEL_URL, {
-        executionProviders: ['wasm'], graphOptimizationLevel: 'all'
-      });
-      log('ONNX loaded (wasm)');
-    }
-
-    // Имена входа/выхода
-    const inputs  = state.session.inputNames  || [];
-    const outputs = state.session.outputNames || [];
-    state.inputName  = FORCE_INPUT_NAME  || inputs[0]  || 'input';
-    state.outputName = FORCE_OUTPUT_NAME || outputs[0] || 'output';
-    log(`I/O: ${state.inputName} → ${state.outputName}`);
-  } catch(err){
-    console.error(err); log('Не удалось загрузить модель'); throw err;
-  }
-}
-
-/** =======================
- *  Preprocess frame -> Tensor
- *  ======================= */
-function preprocessToTensor(video){
-  const [N,C,H,W] = MODEL_CFG.inputShape;
-  // рисуем в маленький буфер модели
-  const inCanvas = createCanvas(W,H);
-  const inCtx = inCanvas.getContext('2d', {willReadFrequently:true});
-  inCtx.drawImage(video, 0, 0, W, H);
-  const img = inCtx.getImageData(0,0,W,H).data;
-
-  // RGBA -> Float32 NCHW (normalize)
-  const data = new Float32Array(N*C*H*W);
-  const [mr, mg, mb] = MODEL_CFG.mean;
-  const [sr, sg, sb] = MODEL_CFG.std;
-
-  // Чтение быстрее по каналам сразу в плоскости
-  const plane = W*H;
-  for(let y=0, i=0; y<H; y++){
-    for(let x=0; x<W; x++, i++){
-      const p = (y*W + x)*4;
-      const r = img[p]/255, g = img[p+1]/255, b = img[p+2]/255;
-
-      const R = (r - mr)/sr;
-      const G = (g - mg)/sg;
-      const B = (b - mb)/sb;
-
-      if (MODEL_CFG.useBGR){
-        data[0*plane + i] = B;
-        data[1*plane + i] = G;
-        data[2*plane + i] = R;
-      } else {
-        data[0*plane + i] = R;
-        data[1*plane + i] = G;
-        data[2*plane + i] = B;
+      // ---------- 1) Запрашиваем камеру ----------
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 540 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+      } catch (e) {
+        alert('Не удалось получить доступ к камере: ' + e);
+        return;
       }
-    }
-  }
-  return new ort.Tensor('float32', data, [N,C,H,W]);
-}
 
-/** =======================
- *  Argmax over channels
- *  (assumes output [1, C, H, W])
- *  ======================= */
-function argmaxChannels(tensor, C, H, W){
-  const src = tensor.data; // Float32Array
-  const pixels = H*W;
-  const cls = new Uint8Array(pixels);
-  for(let i=0; i<pixels; i++){
-    let best = -1e9, idx = 0;
-    for(let c=0; c<C; c++){
-      const v = src[c*pixels + i];
-      if (v > best){ best = v; idx = c; }
-    }
-    cls[i] = idx;
-  }
-  return cls;
-}
+      // Подгоняем канвасы под реальное видео
+      function resizeToVideo() {
+        const w = video.videoWidth || 960;
+        const h = video.videoHeight || 540;
+        out.width = maskCanvas.width = w;
+        out.height = maskCanvas.height = h;
+      }
+      video.addEventListener('loadedmetadata', resizeToVideo);
 
-/** =======================
- *  Build hair mask canvas (video-sized)
- *  ======================= */
-function buildHairMaskCanvas(classMap, H, W, videoW, videoH){
-  // 1) маленькая маска (H×W) в альфу
-  const small = createCanvas(W,H);
-  const sctx = small.getContext('2d');
-  const id = sctx.createImageData(W,H);
-  const hairId = MODEL_CFG.hairClassId;
-  const d = id.data;
-  for(let i=0; i<classMap.length; i++){
-    const isHair = (classMap[i] === hairId);
-    const a = isHair ? 255 : 0;
-    const p = i*4;
-    d[p]=255; d[p+1]=255; d[p+2]=255; d[p+3]=a; // белая маска в альфе
-  }
-  sctx.putImageData(id, 0, 0);
+      // ---------- 2) Инициализация MediaPipe ImageSegmenter ----------
+      const { ImageSegmenter, FilesetResolver, SegmentationMask } = window;
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        // CDN с внутренними ассетами MediaPipe (WASM и пр.)
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
 
-  // 2) апскейлим до размера видео
-  const mask = createCanvas(videoW, videoH);
-  const mctx = mask.getContext('2d');
-  mctx.imageSmoothingEnabled = true;
-  mctx.drawImage(small, 0, 0, videoW, videoH);
-  return mask;
-}
+      // ВАЖНО: путь к модели. Замените на ваш доступный URL .task / .tflite модели сегментации волос.
+      // Рабочие варианты:
+      //  1) Хостите у себя: "/models/hair_segmenter.task"
+      //  2) Или публичный URL .task-модели (если есть)
+      const MODEL_ASSET_PATH = "/models/hair_segmentation.tflite";
 
-/** =======================
- *  Composite: video + tint*mask
- *  без поканального CPU-цикла
- *  ======================= */
-function compositeTint(maskCanvas){
-  const [r,g,b] = state.tintRGB;
-  const a = state.strength;
+      let segmenter = await ImageSegmenter.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: MODEL_ASSET_PATH,
+          delegate: "GPU" // пробуем GPU, браузер сам решит
+        },
+        runningMode: "VIDEO",       // видео-режим (кадры с камеры)
+        outputCategoryMask: true,   // нужен именно categoryMask
+        outputConfidenceMasks: false
+      });
 
-  // 1) рисуем исходный кадр уже сделан в ctx.drawImage(video) раньше
-  // 2) готовим цветной оверлей в отдельном канвасе
-  const W = els.canvas.width, H = els.canvas.height;
-  const overlay = createCanvas(W,H);
-  const octx = overlay.getContext('2d');
+      // ---------- 3) Рендер-цикл ----------
+      let lastTs = -1;
+      function hexToRgb(hex) {
+        const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : { r:255,g:0,b:0 };
+      }
 
-  octx.fillStyle = `rgba(${r},${g},${b},${a})`;
-  octx.fillRect(0,0,W,H);
+      // Быстрое размытие (бокс-фильтр по канвасу маски)
+      function featherMask(radiusPx) {
+        if (radiusPx <= 0) return;
+        // простое двукратное blur для мягкого края
+        mctx.filter = `blur(${radiusPx}px)`;
+        const { width, height } = maskCanvas;
+        const img = mctx.getImageData(0, 0, width, height);
+        mctx.clearRect(0,0,width,height);
+        mctx.putImageData(img, 0, 0);
+        mctx.filter = 'none';
+      }
 
-  // 3) вырезаем по маске (оставляем цвет только в пикселях волос)
-  octx.globalCompositeOperation = 'destination-in';
-  octx.drawImage(maskCanvas, 0, 0, W, H);
-  octx.globalCompositeOperation = 'source-over';
+      const process = async (ts) => {
+        if (video.readyState < 2) { requestAnimationFrame(process); return; }
+        if (ts === undefined) ts = performance.now();
 
-  // 4) кладём поверх основного
-  ctx.drawImage(overlay, 0, 0, W, H);
-}
+        // 1) Получаем сегментацию
+        const result = await segmenter.segmentForVideo(video, ts);
+        const { width, height } = out;
 
-/** =======================
- *  Main loop
- *  ======================= */
-async function loop(){
-  if (!state.running) return;
+        // 2) Рисуем текущий кадр с камеры
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+        ctx.drawImage(video, 0, 0, width, height);
 
-  // отрисовали кадр камеры
-  ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
+        // 3) Извлекаем маску волос в maskCanvas
+        //    categoryMask может быть разных форматов; используем удобный метод рисования,
+        //    если доступен, иначе читаем массив и вручную строим альфа-канал.
+        mctx.clearRect(0, 0, width, height);
 
-  // препроцесс
-  const input = preprocessToTensor(els.video);
+        let haveDrawn = false;
+        if (result.categoryMask && typeof result.categoryMask.drawToCanvas === 'function') {
+          // Новая API: напрямую рисуем серую маску (0..1) в канвас
+          result.categoryMask.drawToCanvas(mctx);
+          haveDrawn = true;
+        }
 
-  // инференс
-  const feeds = {}; feeds[state.inputName] = input;
-  const outMap = await state.session.run(feeds);
-  const out = outMap[state.outputName];
+        if (!haveDrawn && result.categoryMask) {
+          // Старый стиль: берём массив вероятностей и рисуем сами
+          const dataF32 = result.categoryMask.getAsFloat32Array
+            ? result.categoryMask.getAsFloat32Array()
+            : null;
 
-  // ожидаем [1, C, H, W]; если у тебя NHWC — нужно будет адаптировать
-  const C = MODEL_CFG.outputChannels;
-  const H = MODEL_CFG.inputShape[2];
-  const W = MODEL_CFG.inputShape[3];
+          if (dataF32) {
+            const imgData = mctx.createImageData(width, height);
+            const d = imgData.data; // RGBA
+            for (let i = 0; i < width*height; i++) {
+              const v = Math.max(0, Math.min(1, dataF32[i] || 0)); // 0..1
+              // кладём в альфу, RGB можно оставить 0
+              const idx = i * 4;
+              d[idx] = 0; d[idx+1] = 0; d[idx+2] = 0; d[idx+3] = Math.round(v * 255);
+            }
+            mctx.putImageData(imgData, 0, 0);
+            haveDrawn = true;
+          }
+        }
 
-  const classes = argmaxChannels(out, C, H, W);
-  const maskCanvas = buildHairMaskCanvas(classes, H, W, els.canvas.width, els.canvas.height);
+        // 4) Мягчим края маски
+        const feather = parseFloat(featherInput.value);
+        if (feather > 0) featherMask(feather);
 
-  const mode = state.mode;
-  if (mode === 'mask'){
-    // просто показать маску
-    ctx.drawImage(maskCanvas, 0, 0);
-  } else if (mode === 'person'){
-    // закрасим весь детектируемый класс != 0 (грубый дебаг, чаще всего кожа/фон)
-    // Быстрый вариант: используем уже построенную маску волос, но для дебага
-    compositeTint(maskCanvas); // тут красится только hair; для whole-person нужен person-модель/класс
-  } else {
-    // красим только волосы
-    compositeTint(maskCanvas);
-  }
+        // 5) Красим волосы: рисуем цвет на maskCanvas (используя её альфа), потом композиция в out
+        const { r, g, b } = hexToRgb(colorInput.value);
+        mctx.globalCompositeOperation = 'source-in'; // цвет только там, где маска
+        mctx.globalAlpha = 1;
+        mctx.fillStyle = `rgb(${r},${g},${b})`;
+        mctx.fillRect(0, 0, width, height);
 
-  requestAnimationFrame(loop);
-}
+        // 6) Накладываем раскрашенную маску на итог (блендинг и сила)
+        ctx.globalCompositeOperation = blendSelect.value; // color / soft-light / multiply / overlay / screen
+        ctx.globalAlpha = parseFloat(strengthInput.value);
+        ctx.drawImage(maskCanvas, 0, 0, width, height);
 
-/** =======================
- *  UI
- *  ======================= */
-els.start.addEventListener('click', async () => {
-  els.start.disabled = true;
-  try {
-    await startCamera();
-    await loadModel();
-    state.running = true;
-    requestAnimationFrame(loop);
-  } catch(e){
-    els.start.disabled = false;
-  }
-});
+        // 7) Сбрасываем режимы
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
 
-els.mode.addEventListener('change', e => state.mode = e.target.value);
-els.color.addEventListener('input', e => state.tintRGB = hexToRgb(e.target.value));
-els.strength.addEventListener('input', e => state.strength = parseFloat(e.target.value));
-</script>
+        lastTs = ts;
+        requestAnimationFrame(process);
+      };
+      requestAnimationFrame(process);
+
+      // ---------- 4) Снимок ----------
+      snapBtn.addEventListener('click', () => {
+        const url = out.toDataURL('image/png');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'hair-snapshot.png';
+        a.click();
+      });
+
+      // Хендли изменения параметров — просто перерисуем на следующем кадре
+      [colorInput, strengthInput, featherInput, blendSelect].forEach(el => {
+        el.addEventListener('input', () => { /* всё применяется в следующем кадре */ });
+      });
+    })();
+  </script>
 </body>
 </html>
