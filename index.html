@@ -2,11 +2,11 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <title>Hair Color Demo — MediaPipe</title>
+  <title>Hair Color Demo — MediaPipe (UMD)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; background:#0e0e10; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    body { margin:0; background:#0e0e10; color:#fff; font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial,"Noto Sans"; }
     header { padding:12px 16px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #1f1f22; }
     header h1 { font-size:16px; margin:0; font-weight:600; opacity:.9; }
     .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-left:auto; }
@@ -15,38 +15,33 @@
     .controls input[type="range"] { width:160px; }
     main { display:grid; place-items:center; height:calc(100vh - 58px); padding:10px; }
     canvas { width:min(92vw, 960px); height:auto; background:#000; border-radius:14px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
-    .row { display:flex; gap:12px; align-items:center; }
-    .note { font-size:12px; opacity:.7; }
     button { background:#1f6feb; color:#fff; border:0; border-radius:10px; padding:8px 12px; cursor:pointer; font-weight:600; }
     button:disabled { opacity:.5; cursor:default; }
     select { background:#151518; color:#fff; border:1px solid #2a2a31; border-radius:10px; padding:6px 10px; }
+    .warn { font-size:12px; opacity:.75; margin-left:8px; }
   </style>
-  <!-- MediaPipe Tasks (vision) -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js"></script>
+  <!-- ВАЖНО: UMD-бандл без ESM/exports -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/vision_bundle.js"></script>
 </head>
 <body>
   <header>
     <h1>Hair Color — MediaPipe (WebCam)</h1>
     <div class="controls">
-      <label>Цвет
-        <input id="color" type="color" value="#ff3366" />
-      </label>
-      <label>Интенсивность
-        <input id="strength" type="range" min="0" max="1" step="0.01" value="0.8" />
-      </label>
-      <label>Смягчение края
-        <input id="feather" type="range" min="0" max="12" step="0.5" value="4" />
-      </label>
+      <label>Цвет <input id="color" type="color" value="#ff3366" /></label>
+      <label>Интенсивность <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85" /></label>
+      <label>Смягчение <input id="feather" type="range" min="0" max="12" step="0.5" value="4" /></label>
       <label>Блендинг
         <select id="blend">
           <option value="color">color</option>
           <option value="soft-light">soft-light</option>
           <option value="multiply">multiply</option>
-          <option value="overlay">overlay</option>
+          <option value="overlay" selected>overlay</option>
           <option value="screen">screen</option>
         </select>
       </label>
+      <button id="swap">Поменять камеру</button>
       <button id="snap">Сохранить кадр</button>
+      <span class="warn" id="status"></span>
     </div>
   </header>
 
@@ -58,167 +53,175 @@
   <canvas id="mask" width="960" height="540" style="display:none"></canvas>
 
   <script>
-    (async () => {
-      const video = document.getElementById('video');
-      const out = document.getElementById('out');
-      const maskCanvas = document.getElementById('mask');
+    // === НАСТРОЙКА МОДЕЛИ ===
+    // Вариант 1: локально (положите файл в ./models/)
+    const MODEL_ASSET_PATH = "models/hair_segmentation.tflite";
+    // Вариант 2: публичная ссылка (раскомментируйте):
+    // const MODEL_ASSET_PATH = "https://storage.googleapis.com/mediapipe-assets/hair_segmentation.tflite";
 
-      const ctx = out.getContext('2d', { willReadFrequently: false });
-      const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    const statusEl = document.getElementById('status');
+    const colorInput = document.getElementById('color');
+    const strengthInput = document.getElementById('strength');
+    const featherInput = document.getElementById('feather');
+    const blendSelect = document.getElementById('blend');
+    const snapBtn = document.getElementById('snap');
+    const swapBtn = document.getElementById('swap');
 
-      const colorInput   = document.getElementById('color');
-      const strengthInput= document.getElementById('strength');
-      const featherInput = document.getElementById('feather');
-      const blendSelect  = document.getElementById('blend');
-      const snapBtn      = document.getElementById('snap');
+    const video = document.getElementById('video');
+    const out = document.getElementById('out');
+    const maskCanvas = document.getElementById('mask');
+    const ctx = out.getContext('2d');
+    const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
 
-      // ---------- 1) Запрашиваем камеру ----------
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 540 } },
-          audio: false
-        });
-        video.srcObject = stream;
-        await video.play();
-      } catch (e) {
-        alert('Не удалось получить доступ к камере: ' + e);
-        return;
+    let segmenter = null;
+    let currentFacing = 'user'; // 'user' | 'environment'
+    let stream = null;
+
+    function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+    function hexToRgb(hex) {
+      const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+      return m ? { r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16) } : { r:255,g:0,b:0 };
+    }
+
+    function featherMask(radiusPx) {
+      if (radiusPx <= 0) return;
+      const { width, height } = maskCanvas;
+      mctx.filter = `blur(${radiusPx}px)`;
+      const img = mctx.getImageData(0, 0, width, height);
+      mctx.clearRect(0, 0, width, height);
+      mctx.putImageData(img, 0, 0);
+      mctx.filter = 'none';
+    }
+
+    async function initCamera() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
       }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: currentFacing }, width: { ideal: 960 }, height: { ideal: 540 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      resizeToVideo();
+    }
 
-      // Подгоняем канвасы под реальное видео
-      function resizeToVideo() {
-        const w = video.videoWidth || 960;
-        const h = video.videoHeight || 540;
-        out.width = maskCanvas.width = w;
-        out.height = maskCanvas.height = h;
+    function resizeToVideo() {
+      const w = video.videoWidth || 960;
+      const h = video.videoHeight || 540;
+      out.width = maskCanvas.width = w;
+      out.height = maskCanvas.height = h;
+    }
+
+    async function initSegmenter() {
+      const { FilesetResolver, ImageSegmenter } = window;
+      if (!FilesetResolver || !ImageSegmenter) {
+        throw new Error('MediaPipe Tasks (UMD) не инициализировались. Проверьте <script src="...vision_bundle.js">');
       }
-      video.addEventListener('loadedmetadata', resizeToVideo);
-
-      // ---------- 2) Инициализация MediaPipe ImageSegmenter ----------
-      const { ImageSegmenter, FilesetResolver, SegmentationMask } = window;
-      const filesetResolver = await FilesetResolver.forVisionTasks(
-        // CDN с внутренними ассетами MediaPipe (WASM и пр.)
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      const fileset = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/wasm"
       );
-
-      // ВАЖНО: путь к модели. Замените на ваш доступный URL .task / .tflite модели сегментации волос.
-      // Рабочие варианты:
-      //  1) Хостите у себя: "/models/hair_segmenter.task"
-      //  2) Или публичный URL .task-модели (если есть)
-      const MODEL_ASSET_PATH = "/models/hair_segmentation.tflite";
-
-      let segmenter = await ImageSegmenter.createFromOptions(filesetResolver, {
-        baseOptions: {
-          modelAssetPath: MODEL_ASSET_PATH,
-          delegate: "GPU" // пробуем GPU, браузер сам решит
-        },
-        runningMode: "VIDEO",       // видео-режим (кадры с камеры)
-        outputCategoryMask: true,   // нужен именно categoryMask
+      segmenter = await ImageSegmenter.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_ASSET_PATH, delegate: "GPU" },
+        runningMode: "VIDEO",
+        outputCategoryMask: true,
         outputConfidenceMasks: false
       });
+    }
 
-      // ---------- 3) Рендер-цикл ----------
-      let lastTs = -1;
-      function hexToRgb(hex) {
-        const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-        return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : { r:255,g:0,b:0 };
+    async function processFrame(ts) {
+      if (!segmenter || video.readyState < 2) {
+        requestAnimationFrame(processFrame);
+        return;
       }
+      const { width, height } = out;
 
-      // Быстрое размытие (бокс-фильтр по канвасу маски)
-      function featherMask(radiusPx) {
-        if (radiusPx <= 0) return;
-        // простое двукратное blur для мягкого края
-        mctx.filter = `blur(${radiusPx}px)`;
-        const { width, height } = maskCanvas;
-        const img = mctx.getImageData(0, 0, width, height);
-        mctx.clearRect(0,0,width,height);
-        mctx.putImageData(img, 0, 0);
-        mctx.filter = 'none';
-      }
+      // 1) Сегментация
+      const result = await segmenter.segmentForVideo(video, performance.now());
 
-      const process = async (ts) => {
-        if (video.readyState < 2) { requestAnimationFrame(process); return; }
-        if (ts === undefined) ts = performance.now();
+      // 2) Базовое изображение — поток камеры
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      ctx.drawImage(video, 0, 0, width, height);
 
-        // 1) Получаем сегментацию
-        const result = await segmenter.segmentForVideo(video, ts);
-        const { width, height } = out;
+      // 3) Маска (альфа)
+      mctx.clearRect(0, 0, width, height);
+      let drawn = false;
 
-        // 2) Рисуем текущий кадр с камеры
-        ctx.globalCompositeOperation = 'source-over';
-        ctx.globalAlpha = 1;
-        ctx.drawImage(video, 0, 0, width, height);
-
-        // 3) Извлекаем маску волос в maskCanvas
-        //    categoryMask может быть разных форматов; используем удобный метод рисования,
-        //    если доступен, иначе читаем массив и вручную строим альфа-канал.
-        mctx.clearRect(0, 0, width, height);
-
-        let haveDrawn = false;
-        if (result.categoryMask && typeof result.categoryMask.drawToCanvas === 'function') {
-          // Новая API: напрямую рисуем серую маску (0..1) в канвас
-          result.categoryMask.drawToCanvas(mctx);
-          haveDrawn = true;
-        }
-
-        if (!haveDrawn && result.categoryMask) {
-          // Старый стиль: берём массив вероятностей и рисуем сами
-          const dataF32 = result.categoryMask.getAsFloat32Array
-            ? result.categoryMask.getAsFloat32Array()
-            : null;
-
-          if (dataF32) {
-            const imgData = mctx.createImageData(width, height);
-            const d = imgData.data; // RGBA
-            for (let i = 0; i < width*height; i++) {
-              const v = Math.max(0, Math.min(1, dataF32[i] || 0)); // 0..1
-              // кладём в альфу, RGB можно оставить 0
-              const idx = i * 4;
-              d[idx] = 0; d[idx+1] = 0; d[idx+2] = 0; d[idx+3] = Math.round(v * 255);
-            }
-            mctx.putImageData(imgData, 0, 0);
-            haveDrawn = true;
+      if (result.categoryMask && typeof result.categoryMask.drawToCanvas === 'function') {
+        result.categoryMask.drawToCanvas(mctx);
+        drawn = true;
+      } else if (result.categoryMask && typeof result.categoryMask.getAsFloat32Array === 'function') {
+        const arr = result.categoryMask.getAsFloat32Array();
+        if (arr && arr.length >= width * height) {
+          const imgData = mctx.createImageData(width, height);
+          const d = imgData.data;
+          for (let i = 0; i < width * height; i++) {
+            const v = Math.max(0, Math.min(1, arr[i] || 0));
+            const idx = i * 4;
+            d[idx] = d[idx+1] = d[idx+2] = 0;
+            d[idx+3] = Math.round(v * 255);
           }
+          mctx.putImageData(imgData, 0, 0);
+          drawn = true;
         }
+      }
 
-        // 4) Мягчим края маски
-        const feather = parseFloat(featherInput.value);
-        if (feather > 0) featherMask(feather);
+      // 4) Смягчение края
+      const feather = parseFloat(featherInput.value);
+      if (drawn && feather > 0) featherMask(feather);
 
-        // 5) Красим волосы: рисуем цвет на maskCanvas (используя её альфа), потом композиция в out
-        const { r, g, b } = hexToRgb(colorInput.value);
-        mctx.globalCompositeOperation = 'source-in'; // цвет только там, где маска
+      // 5) Окраска
+      const { r, g, b } = hexToRgb(colorInput.value);
+      if (drawn) {
+        mctx.globalCompositeOperation = 'source-in'; // применяем цвет только в зоне маски
         mctx.globalAlpha = 1;
         mctx.fillStyle = `rgb(${r},${g},${b})`;
         mctx.fillRect(0, 0, width, height);
 
-        // 6) Накладываем раскрашенную маску на итог (блендинг и сила)
-        ctx.globalCompositeOperation = blendSelect.value; // color / soft-light / multiply / overlay / screen
+        // 6) Блендинг поверх камеры
+        ctx.globalCompositeOperation = blendSelect.value; // color, overlay, multiply, ...
         ctx.globalAlpha = parseFloat(strengthInput.value);
         ctx.drawImage(maskCanvas, 0, 0, width, height);
 
-        // 7) Сбрасываем режимы
+        // Сброс
         ctx.globalCompositeOperation = 'source-over';
         ctx.globalAlpha = 1;
+      }
 
-        lastTs = ts;
-        requestAnimationFrame(process);
-      };
-      requestAnimationFrame(process);
+      requestAnimationFrame(processFrame);
+    }
 
-      // ---------- 4) Снимок ----------
-      snapBtn.addEventListener('click', () => {
-        const url = out.toDataURL('image/png');
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'hair-snapshot.png';
-        a.click();
-      });
+    snapBtn.addEventListener('click', () => {
+      const url = out.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'hair-snapshot.png';
+      a.click();
+    });
 
-      // Хендли изменения параметров — просто перерисуем на следующем кадре
-      [colorInput, strengthInput, featherInput, blendSelect].forEach(el => {
-        el.addEventListener('input', () => { /* всё применяется в следующем кадре */ });
-      });
+    swapBtn.addEventListener('click', async () => {
+      currentFacing = currentFacing === 'user' ? 'environment' : 'user';
+      await initCamera();
+    });
+
+    (async function start() {
+      try {
+        setStatus('Инициализация камеры…');
+        await initCamera();
+        video.addEventListener('loadedmetadata', resizeToVideo, { once: true });
+
+        setStatus('Загрузка сегментера…');
+        await initSegmenter();
+
+        setStatus('Готово');
+        requestAnimationFrame(processFrame);
+      } catch (e) {
+        console.error(e);
+        setStatus('Ошибка: ' + (e && e.message ? e.message : e));
+        alert('Ошибка при запуске демо:\n' + e);
+      }
     })();
   </script>
 </body>
