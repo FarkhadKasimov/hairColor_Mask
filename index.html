@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <title>Hair Color Demo — MediaPipe (UMD)</title>
+  <title>Hair Color Demo — MediaPipe (UMD + ESM fallback)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { color-scheme: dark; }
@@ -20,8 +20,8 @@
     select { background:#151518; color:#fff; border:1px solid #2a2a31; border-radius:10px; padding:6px 10px; }
     .warn { font-size:12px; opacity:.75; margin-left:8px; }
   </style>
-  <!-- ВАЖНО: UMD-бандл без ESM/exports -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/vision_bundle.js"></script>
+  <!-- 1) СТАБИЛЬНЫЙ UMD-бандл (без type="module") -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/vision_bundle.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <header>
@@ -54,30 +54,41 @@
 
   <script>
     // === НАСТРОЙКА МОДЕЛИ ===
-    // Вариант 1: локально (положите файл в ./models/)
+    // Вариант 1: локальный файл рядом со страницей:
     const MODEL_ASSET_PATH = "models/hair_segmentation.tflite";
-    // Вариант 2: публичная ссылка (раскомментируйте):
+    // Вариант 2: публичная ссылка (раскомментировать одну строку ниже, если хотите):
     // const MODEL_ASSET_PATH = "https://storage.googleapis.com/mediapipe-assets/hair_segmentation.tflite";
 
-    const statusEl = document.getElementById('status');
-    const colorInput = document.getElementById('color');
-    const strengthInput = document.getElementById('strength');
-    const featherInput = document.getElementById('feather');
-    const blendSelect = document.getElementById('blend');
-    const snapBtn = document.getElementById('snap');
-    const swapBtn = document.getElementById('swap');
-
-    const video = document.getElementById('video');
-    const out = document.getElementById('out');
-    const maskCanvas = document.getElementById('mask');
-    const ctx = out.getContext('2d');
-    const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    const statusEl       = document.getElementById('status');
+    const colorInput     = document.getElementById('color');
+    const strengthInput  = document.getElementById('strength');
+    const featherInput   = document.getElementById('feather');
+    const blendSelect    = document.getElementById('blend');
+    const snapBtn        = document.getElementById('snap');
+    const swapBtn        = document.getElementById('swap');
+    const video          = document.getElementById('video');
+    const out            = document.getElementById('out');
+    const maskCanvas     = document.getElementById('mask');
+    const ctx            = out.getContext('2d');
+    const mctx           = maskCanvas.getContext('2d', { willReadFrequently: true });
 
     let segmenter = null;
     let currentFacing = 'user'; // 'user' | 'environment'
     let stream = null;
 
     function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+    // Ждём, пока UMD положит глобалы в window; иначе подключим ESM-фолбэк
+    function untilMPReady(timeout = 4000) {
+      return new Promise((resolve, reject) => {
+        const t0 = performance.now();
+        (function tick() {
+          if (window.FilesetResolver && window.ImageSegmenter) return resolve();
+          if (performance.now() - t0 > timeout) return reject(new Error('UMD not ready'));
+          requestAnimationFrame(tick);
+        })();
+      });
+    }
 
     function hexToRgb(hex) {
       const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -95,9 +106,7 @@
     }
 
     async function initCamera() {
-      if (stream) {
-        stream.getTracks().forEach(t => t.stop());
-      }
+      if (stream) stream.getTracks().forEach(t => t.stop());
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: currentFacing }, width: { ideal: 960 }, height: { ideal: 540 } },
         audio: false
@@ -115,14 +124,10 @@
     }
 
     async function initSegmenter() {
-      const { FilesetResolver, ImageSegmenter } = window;
-      if (!FilesetResolver || !ImageSegmenter) {
-        throw new Error('MediaPipe Tasks (UMD) не инициализировались. Проверьте <script src="...vision_bundle.js">');
-      }
-      const fileset = await FilesetResolver.forVisionTasks(
+      const fileset = await window.FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/wasm"
       );
-      segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      segmenter = await window.ImageSegmenter.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: MODEL_ASSET_PATH, delegate: "GPU" },
         runningMode: "VIDEO",
         outputCategoryMask: true,
@@ -130,7 +135,7 @@
       });
     }
 
-    async function processFrame(ts) {
+    async function processFrame() {
       if (!segmenter || video.readyState < 2) {
         requestAnimationFrame(processFrame);
         return;
@@ -140,12 +145,12 @@
       // 1) Сегментация
       const result = await segmenter.segmentForVideo(video, performance.now());
 
-      // 2) Базовое изображение — поток камеры
+      // 2) Базовый кадр камеры
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = 1;
       ctx.drawImage(video, 0, 0, width, height);
 
-      // 3) Маска (альфа)
+      // 3) Маска в maskCanvas
       mctx.clearRect(0, 0, width, height);
       let drawn = false;
 
@@ -173,19 +178,18 @@
       if (drawn && feather > 0) featherMask(feather);
 
       // 5) Окраска
-      const { r, g, b } = hexToRgb(colorInput.value);
       if (drawn) {
-        mctx.globalCompositeOperation = 'source-in'; // применяем цвет только в зоне маски
+        const { r, g, b } = hexToRgb(colorInput.value);
+        mctx.globalCompositeOperation = 'source-in';
         mctx.globalAlpha = 1;
         mctx.fillStyle = `rgb(${r},${g},${b})`;
         mctx.fillRect(0, 0, width, height);
 
-        // 6) Блендинг поверх камеры
-        ctx.globalCompositeOperation = blendSelect.value; // color, overlay, multiply, ...
+        // 6) Блендинг поверх
+        ctx.globalCompositeOperation = blendSelect.value; // color/overlay/…
         ctx.globalAlpha = parseFloat(strengthInput.value);
         ctx.drawImage(maskCanvas, 0, 0, width, height);
 
-        // Сброс
         ctx.globalCompositeOperation = 'source-over';
         ctx.globalAlpha = 1;
       }
@@ -208,11 +212,20 @@
 
     (async function start() {
       try {
-        setStatus('Инициализация камеры…');
+        setStatus('Инициализация…');
+
+        // 2) Если UMD не успел — пробуем ESM-фолбэк и пробрасываем глобалы
+        try { await untilMPReady(); }
+        catch {
+          const mod = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/vision_bundle.mjs');
+          window.FilesetResolver = mod.FilesetResolver;
+          window.ImageSegmenter  = mod.ImageSegmenter;
+        }
+
         await initCamera();
         video.addEventListener('loadedmetadata', resizeToVideo, { once: true });
 
-        setStatus('Загрузка сегментера…');
+        setStatus('Загрузка модели…');
         await initSegmenter();
 
         setStatus('Готово');
