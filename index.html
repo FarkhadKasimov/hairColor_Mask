@@ -39,12 +39,12 @@
         <input id="solidColor" type="color" value="#9b4dff" />
       </label>
       <div class="swatches" id="presets">
-        <button class="sw" data-color="#C0392B" style="background:#C0392B"></button>
-        <button class="sw" data-color="#F1C40F" style="background:#F1C40F"></button>
-        <button class="sw" data-color="#27AE60" style="background:#27AE60"></button>
-        <button class="sw" data-color="#3498DB" style="background:#3498DB"></button>
-        <button class="sw" data-color="#8E44AD" style="background:#8E44AD"></button>
-        <button class="sw" data-color="#2C3E50" style="background:#2C3E50"></button>
+        <button class="sw" data-color="#C0392B" style="background:#C0392B" title="Красный"></button>
+        <button class="sw" data-color="#F1C40F" style="background:#F1C40F" title="Блонд"></button>
+        <button class="sw" data-color="#27AE60" style="background:#27AE60" title="Зелёный"></button>
+        <button class="sw" data-color="#3498DB" style="background:#3498DB" title="Синий"></button>
+        <button class="sw" data-color="#8E44AD" style="background:#8E44AD" title="Фиолетовый"></button>
+        <button class="sw" data-color="#2C3E50" style="background:#2C3E50" title="Тёмный"></button>
       </div>
     </div>
 
@@ -53,12 +53,23 @@
       <label class="inline"><span>Низ</span><input id="bottomColor" type="color" value="#8e44ad" /></label>
       <label class="inline"><span>Смещение</span><input id="gradientShift" type="range" min="-0.5" max="0.5" step="0.01" value="0" /></label>
     </div>
+
+    <div class="hsl">
+      <label class="inline"><span>Hue</span><input id="hue" type="range" min="-180" max="180" step="1" value="0" /></label>
+      <label class="inline"><span>Sat</span><input id="sat" type="range" min="-100" max="100" step="1" value="0" /></label>
+      <label class="inline"><span>Light</span><input id="light" type="range" min="-100" max="100" step="1" value="0" /></label>
+      <button id="resetHSL">Сброс HSL</button>
+    </div>
   </section>
 
   <main>
     <video id="video" autoplay playsinline muted></video>
     <div class="stage"><canvas id="canvas"></canvas><div id="status">Загрузка…</div></div>
   </main>
+
+  <footer>
+    <small>Работает по HTTPS. Модель: MediaPipe HairSegmenter (браузер).</small>
+  </footer>
 
   <script type="module" src="./scripts/main.js"></script>
 </body>
