@@ -79,6 +79,10 @@ function renderPresets() {
 // вызвать один раз при загрузке
 renderPresets();
 
+// установить первый цвет по умолчанию
+if (PRESET_COLORS.length > 0 && els.solidColor) {
+  els.solidColor.value = PRESET_COLORS[0];
+}
 
 const ctx = els.canvas.getContext('2d');
 let segmenter = null;
