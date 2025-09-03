@@ -285,7 +285,7 @@ function drawLoop() {
   if (!running) return;
   if (lastMaskCanvas) {
     drawCompositeWithMask(lastMaskCanvas);
-    setStatus('Работает ✔ (iOS-safe)');
+    setStatus('Работает)');
   } else {
     // первая маска ещё не пришла — показываем видео
     ctx.globalCompositeOperation = 'source-over';
