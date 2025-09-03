@@ -1,5 +1,18 @@
-// Hair Color Demo using MediaPipe Tasks Vision (HairSegmenter) — accuracy tuned
+// Hair Color Demo — FPS-optimized (dual loop + downscale segmentation)
 import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.2";
+
+/* ========= ПАРАМЕТРЫ ПРОИЗВОДИТЕЛЬНОСТИ ========= */
+const SEG_FPS   = 15;     // частота вычисления маски (рекомендую 12–20)
+const SEG_SCALE = 0.5;    // масштаб для сегментации (0.5 = половина ширины/высоты)
+const USE_CONF  = true;   // использовать confidence mask (точнее, но иногда медленнее)
+const ACC = {
+  thresh: 0.60,
+  gain: 1.10,
+  emaAlpha: 0.25, // полегче сглаживание
+  blur: false,    // blur выключен ради FPS
+  rethresh: 0.50
+};
+/* =============================================== */
 
 const els = {
   start: document.getElementById('startBtn'),
@@ -28,30 +41,34 @@ const els = {
 const ctx = els.canvas.getContext('2d');
 let segmenter = null;
 let running = false;
-let rafId = null;
-let lastTick = 0;
 
-// ====== Тонкая настройка точности ======
-const ACC = {
-  thresh: 0.60,      // порог уверенности (0..1)
-  gain: 1.20,        // усиление вероятностей перед порогом
-  emaAlpha: 0.35,    // коэффициент EMA (0..1) — чем больше, тем быстрее реагирует
-  blur: true,        // вкл. 3×3 blur по альфе
-  rethresh: 0.50     // порог после blur (для подчистки)
-};
+// — канвас для расчёта (уменьшенный)
+const computeCanvas = document.createElement('canvas');
+const computeCtx = computeCanvas.getContext('2d', { willReadFrequently: true });
 
-let prevAlpha = null;  // Float32Array для EMA
+// — оффскрин под RGBA маску (в compute-разрешении)
+const maskCanvas = document.createElement('canvas');
+const maskCtx = maskCanvas.getContext('2d');
 
-function setStatus(t){ els.status.textContent = t ?? ''; }
+// последняя готовая маска (в compute-разрешении) и EMA-буфер
+let lastMaskImageBitmap = null; // для быстрой отрисовки
+let prevAlpha = null;
+
+// таймеры циклов
+let drawRaf = 0;
+let segTimer = 0;
+
+function setStatus(t){ if (els.status) els.status.textContent = t ?? ''; }
 function clamp01(v){ return v < 0 ? 0 : v > 1 ? 1 : v; }
 function minmax(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
+/* ============ ИНИЦИАЛИЗАЦИЯ ============ */
 async function setupCamera() {
   els.video.setAttribute('playsinline', '');
   els.video.muted = true;
 
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } }, // чуть выше разрешение → точнее маска
+    video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } },
     audio: false
   });
   els.video.srcObject = stream;
@@ -64,18 +81,23 @@ async function setupCamera() {
 
   const vw = els.video.videoWidth || 640;
   const vh = els.video.videoHeight || 480;
+
   els.canvas.width = vw;
   els.canvas.height = vh;
 
-  ctx.globalAlpha = 1;
-  ctx.globalCompositeOperation = 'source-over';
-  setStatus(`Камера готова ${vw}×${vh}`);
-  ctx.drawImage(els.video, 0, 0, vw, vh);
+  // compute-resolution
+  computeCanvas.width = Math.max(64, Math.round(vw * SEG_SCALE));
+  computeCanvas.height = Math.max(64, Math.round(vh * SEG_SCALE));
 
-  // дефолтная интенсивность 0.3
+  // маска в compute-рес
+  maskCanvas.width = computeCanvas.width;
+  maskCanvas.height = computeCanvas.height;
+
+  // дефолтная интенсивность
   if (els.strength) els.strength.value = "0.3";
 
-  console.debug('video readyState:', els.video.readyState, 'size:', vw, vh);
+  setStatus(`Камера готова ${vw}×${vh}, seg ${computeCanvas.width}×${computeCanvas.height}`);
+  ctx.drawImage(els.video, 0, 0, vw, vh);
 }
 
 async function initSegmenter() {
@@ -89,27 +111,22 @@ async function initSegmenter() {
     },
     runningMode: "VIDEO",
     outputCategoryMask: true,
-    outputConfidenceMasks: true   // важное: включаем confidence masks
+    outputConfidenceMasks: USE_CONF
   });
   setStatus('Модель загружена');
 }
 
-/* ---------- Пост-обработка маски для точности ---------- */
-// достаём альфу (0..1) из confidence mask класса hair
+/* ============ ПОСТОБРАБОТКА МАСОК ============ */
 function alphaFromConfidenceMask(confMask) {
-  // берём «волосы» = индекс 1
   const w = confMask.width ?? confMask.cols ?? confMask.shape?.[1];
   const h = confMask.height ?? confMask.rows ?? confMask.shape?.[0];
-
   const f32 = (typeof confMask.getAsFloat32Array === 'function')
     ? confMask.getAsFloat32Array()
     : null;
   if (!f32) throw new Error('No Float32 confidence mask');
 
-  // усиление и порог
   const out = new Float32Array(f32.length);
-  const t = ACC.thresh;
-  const g = ACC.gain;
+  const t = ACC.thresh, g = ACC.gain;
   for (let i=0; i<f32.length; i++){
     const v = clamp01(f32[i] * g);
     out[i] = v >= t ? v : 0;
@@ -117,7 +134,6 @@ function alphaFromConfidenceMask(confMask) {
   return { alpha: out, w, h };
 }
 
-// простенький 3×3 box blur по альфе (в Float32), затем повторный порог
 function blurAndRethreshold(alpha, w, h, rethresh) {
   if (!ACC.blur) return alpha;
   const dst = new Float32Array(alpha.length);
@@ -126,19 +142,9 @@ function blurAndRethreshold(alpha, w, h, rethresh) {
     for (let x=0; x<w; x++){
       const x0 = x-1, x1 = x, x2 = x+1;
       let sum = 0, cnt = 0;
-      const p = (yy, xx) => {
-        if (xx<0 || yy<0 || xx>=w || yy>=h) return 0;
-        return alpha[yy*w + xx];
-      };
-      sum += p(y0,x0); cnt++;
-      sum += p(y0,x1); cnt++;
-      sum += p(y0,x2); cnt++;
-      sum += p(y1,x0); cnt++;
-      sum += p(y1,x1); cnt++;
-      sum += p(y1,x2); cnt++;
-      sum += p(y2,x0); cnt++;
-      sum += p(y2,x1); cnt++;
-      sum += p(y2,x2); cnt++;
+      const p = (yy, xx) => (xx<0||yy<0||xx>=w||yy>=h) ? 0 : alpha[yy*w+xx];
+      sum += p(y0,x0)+p(y0,x1)+p(y0,x2)+p(y1,x0)+p(y1,x1)+p(y1,x2)+p(y2,x0)+p(y2,x1)+p(y2,x2);
+      cnt = 9;
       const m = sum / cnt;
       dst[y*w + x] = (m >= rethresh) ? m : 0;
     }
@@ -146,7 +152,6 @@ function blurAndRethreshold(alpha, w, h, rethresh) {
   return dst;
 }
 
-// EMA по альфе, чтобы маска меньше «дышала» (вес текущего кадра = emaAlpha)
 function emaAlphaBlend(curr, prev, a){
   if (!prev || prev.length !== curr.length) return curr.slice();
   const out = new Float32Array(curr.length);
@@ -157,28 +162,20 @@ function emaAlphaBlend(curr, prev, a){
   return out;
 }
 
-// превращаем Float32 альфу (0..1) в RGBA ImageData маски (белый с альфой)
-function alphaToMaskCanvas(alpha, w, h, canvas, ctx2d) {
-  canvas.width = w; canvas.height = h;
-  const id = ctx2d.createImageData(w, h);
+function alphaToMaskBitmap(alpha, w, h) {
+  maskCanvas.width = w; maskCanvas.height = h;
+  const id = maskCtx.createImageData(w, h);
   const data = id.data;
   for (let i=0; i<alpha.length; i++){
     const a = minmax(Math.round(alpha[i]*255), 0, 255);
     const off = i*4;
-    data[off+0] = 255;
-    data[off+1] = 255;
-    data[off+2] = 255;
-    data[off+3] = a;
+    data[off] = 255; data[off+1] = 255; data[off+2] = 255; data[off+3] = a;
   }
-  ctx2d.putImageData(id, 0, 0);
-  return canvas;
+  maskCtx.putImageData(id, 0, 0);
+  return createImageBitmap(maskCanvas); // быстрый апскейл на основной canvas
 }
 
-// оффскрин под готовую маску
-const offMaskCanvas = document.createElement('canvas');
-const offMaskCtx = offMaskCanvas.getContext('2d');
-
-/* ---------- Рендер ---------- */
+/* ============ РЕНДЕР ============ */
 function applyHSLAdjustments(baseCanvas) {
   const w = els.canvas.width;
   const h = els.canvas.height;
@@ -188,7 +185,7 @@ function applyHSLAdjustments(baseCanvas) {
 
   tctx.drawImage(baseCanvas, 0, 0);
 
-  const light = parseInt(els.light.value || "0", 10);
+  const light = parseInt(els.light?.value || "0", 10);
   if (light !== 0) {
     tctx.globalAlpha = minmax(Math.abs(light)/100, 0, 1);
     tctx.globalCompositeOperation = (light > 0) ? 'screen' : 'multiply';
@@ -197,7 +194,7 @@ function applyHSLAdjustments(baseCanvas) {
     tctx.globalAlpha = 1;
   }
 
-  const sat = parseInt(els.sat.value || "0", 10);
+  const sat = parseInt(els.sat?.value || "0", 10);
   if (sat !== 0) {
     const img = tctx.getImageData(0,0,w,h);
     const data = img.data;
@@ -226,15 +223,15 @@ function applyHSLAdjustments(baseCanvas) {
   return tmp;
 }
 
-function drawSolidOrGradientMasked(maskCanvas) {
+function drawCompositeWithMask(maskBitmap) {
   const w = els.canvas.width, h = els.canvas.height;
 
-  // База — «сырое» видео
+  // 1) База — видео
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   ctx.drawImage(els.video, 0, 0, w, h);
 
-  // Цветовой слой
+  // 2) Цветовой слой
   const tmp = document.createElement('canvas');
   tmp.width = w; tmp.height = h;
   const tctx = tmp.getContext('2d');
@@ -253,113 +250,103 @@ function drawSolidOrGradientMasked(maskCanvas) {
   }
   tctx.fillRect(0, 0, w, h);
 
-  // Feather через даун/апскейл
-  const feather = parseFloat(els.feather.value || "0.4");
-  const fw = Math.max(1, Math.floor(w / (1 + 2*feather)));
-  const fh = Math.max(1, Math.floor(h / (1 + 2*feather)));
-  const featherCanvas = document.createElement('canvas');
-  featherCanvas.width = fw; featherCanvas.height = fh;
-  const fctx = featherCanvas.getContext('2d');
-  fctx.imageSmoothingEnabled = true;
-  fctx.imageSmoothingQuality = 'high';
-  fctx.drawImage(maskCanvas, 0, 0, fw, fh);
-
-  // Маска → цвет
+  // 3) Применяем маску (upscale из compute-рес)
   tctx.globalCompositeOperation = 'destination-in';
-  tctx.drawImage(featherCanvas, 0, 0, fw, fh, 0, 0, w, h);
+  tctx.imageSmoothingEnabled = true;
+  tctx.imageSmoothingQuality = 'high';
+  tctx.drawImage(maskBitmap, 0, 0, w, h);
 
-  // Интенсивность (по умолчанию 0.3 выставлена в setupCamera)
+  // 4) Интенсивность
   const strength = parseFloat(els.strength.value || "0.3");
   ctx.globalAlpha = minmax(strength, 0, 1);
   ctx.globalCompositeOperation = 'source-over';
   ctx.drawImage(tctx.canvas, 0, 0, w, h);
 
-  // Текстура волос
+  // 5) Текстура волос
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'soft-light';
   ctx.drawImage(els.video, 0, 0, w, h);
 
-  // HSL-коррекция
+  // 6) HSL-коррекция
   ctx.globalCompositeOperation = 'source-over';
   const adjusted = applyHSLAdjustments(els.canvas);
   ctx.drawImage(adjusted, 0, 0);
 }
 
-async function renderStep(ts) {
-  // всегда есть «сырой» кадр
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.globalAlpha = 1;
-  ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
-
-  try {
-    const res = await segmenter.segmentForVideo(els.video, ts ?? performance.now());
-    // берём confidenceMasks[1] — вероятность «волосы»
-    const conf = res?.confidenceMasks?.[1];
-    const cat = res?.categoryMask;
-
-    if (conf) {
-      // от confidence к альфе
-      let { alpha, w, h } = alphaFromConfidenceMask(conf);
-      // EMA
-      alpha = emaAlphaBlend(alpha, prevAlpha, ACC.emaAlpha);
-      prevAlpha = alpha;
-      // blur + повторный порог
-      alpha = blurAndRethreshold(alpha, w, h, ACC.rethresh);
-      // альфа → RGBA маска-канвас
-      const maskCanvas = alphaToMaskCanvas(alpha, w, h, offMaskCanvas, offMaskCtx);
-      drawSolidOrGradientMasked(maskCanvas);
-      setStatus('Работает ✔ (confidence)');
-      return;
-    }
-
-    // fallback: категория (на случай отсутствия confidence mask)
-    if (cat) {
-      // старый путь — просто бинарная маска
-      let mw = cat.width ?? cat.cols ?? cat.shape?.[1];
-      let mh = cat.height ?? cat.rows ?? cat.shape?.[0];
-      let src = null;
-      if (cat.getAsUint8Array) src = cat.getAsUint8Array();
-      else if (cat.data) src = cat.data;
-      if (!mw || !mh) { mw = els.canvas.width; mh = Math.max(1, Math.round(src.length / mw)); }
-
-      const alpha = new Float32Array(mw*mh);
-      for (let i=0; i<mw*mh; i++) alpha[i] = (src[i] === 1) ? 1 : 0;
-      // EMA и blur тоже применим
-      const sm = emaAlphaBlend(alpha, prevAlpha, ACC.emaAlpha);
-      prevAlpha = sm;
-      const alpha2 = blurAndRethreshold(sm, mw, mh, ACC.rethresh);
-      const maskCanvas = alphaToMaskCanvas(alpha2, mw, mh, offMaskCanvas, offMaskCtx);
-      drawSolidOrGradientMasked(maskCanvas);
-      setStatus('Работает ✔ (category)');
-      return;
-    }
-
-    setStatus('Ожидание маски…');
-  } catch (e) {
-    console.error('segmentForVideo error:', e);
-    setStatus('Сегментация недоступна, показываю сырое видео');
+/* ===== ЦИКЛ ОТРИСОВКИ (60 FPS) ===== */
+function drawLoop() {
+  if (!running) return;
+  // если есть последняя маска — используем её; если нет — просто видео
+  if (lastMaskImageBitmap) {
+    drawCompositeWithMask(lastMaskImageBitmap);
+    setStatus('Работает ✔ (асинхронно)');
+  } else {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
+    setStatus('Ожидание первой маски…');
   }
+  drawRaf = requestAnimationFrame(drawLoop);
 }
 
-function loop(ts) {
+/* ===== ЦИКЛ СЕГМЕНТАЦИИ (SEG_FPS) ===== */
+async function segStep() {
   if (!running) return;
-  if (ts - lastTick > 33) { // ~30 FPS
-    renderStep(ts);
-    lastTick = ts;
+  try {
+    // рисуем уменьшенное видео -> computeCanvas
+    computeCtx.drawImage(
+      els.video, 0, 0, computeCanvas.width, computeCanvas.height
+    );
+    const ts = performance.now();
+    const res = await segmenter.segmentForVideo(computeCanvas, ts);
+
+    let alpha = null, w = computeCanvas.width, h = computeCanvas.height;
+
+    if (USE_CONF && res?.confidenceMasks?.[1]) {
+      const { alpha: a, w: ww, h: hh } = alphaFromConfidenceMask(res.confidenceMasks[1]);
+      alpha = a; w = ww; h = hh;
+    } else if (res?.categoryMask) {
+      // fallback: category
+      const cat = res.categoryMask;
+      let mw = cat.width ?? cat.cols ?? cat.shape?.[1];
+      let mh = cat.height ?? cat.rows ?? cat.shape?.[0];
+      let src = cat.getAsUint8Array ? cat.getAsUint8Array() : cat.data;
+      if (!mw || !mh) { mw = w; mh = h; }
+      const a = new Float32Array(mw*mh);
+      for (let i=0; i<mw*mh; i++) a[i] = (src[i] === 1) ? 1 : 0;
+      alpha = a; w = mw; h = mh;
+    }
+
+    if (alpha) {
+      // EMA + (опц.) blur + порог
+      alpha = emaAlphaBlend(alpha, prevAlpha, ACC.emaAlpha);
+      prevAlpha = alpha;
+      if (ACC.blur) alpha = blurAndRethreshold(alpha, w, h, ACC.rethresh);
+
+      // Готовим bitmap маски (в compute-рес)
+      const bitmap = await alphaToMaskBitmap(alpha, w, h);
+      // Обновляем «последнюю маску» атомарно
+      if (lastMaskImageBitmap) lastMaskImageBitmap.close?.();
+      lastMaskImageBitmap = bitmap;
+    }
+  } catch (e) {
+    console.warn('segStep error:', e);
   }
-  rafId = requestAnimationFrame(loop);
 }
 
 /* --------- UI --------- */
-
 els.start.addEventListener('click', async () => {
   try {
     if (!segmenter) await initSegmenter();
     await setupCamera();
     running = true;
-    lastTick = 0;
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = requestAnimationFrame(loop);
+
+    // стартуем оба цикла
+    drawRaf && cancelAnimationFrame(drawRaf);
+    drawRaf = requestAnimationFrame(drawLoop);
+
+    segTimer && clearInterval(segTimer);
+    segTimer = setInterval(segStep, Math.max(16, Math.round(1000 / SEG_FPS))); // ~15 FPS
   } catch (e) {
     console.error(e);
     setStatus('Ошибка: ' + e.message);
@@ -368,13 +355,15 @@ els.start.addEventListener('click', async () => {
 
 els.stop.addEventListener('click', () => {
   running = false;
-  if (rafId) cancelAnimationFrame(rafId);
+  drawRaf && cancelAnimationFrame(drawRaf);
+  segTimer && clearInterval(segTimer);
   setStatus('Остановлено');
 });
 
 els.snap.addEventListener('click', () => {
   running = false;
-  if (rafId) cancelAnimationFrame(rafId);
+  drawRaf && cancelAnimationFrame(drawRaf);
+  segTimer && clearInterval(segTimer);
   setStatus('Снимок (заморожено)');
 });
 
