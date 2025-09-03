@@ -5,12 +5,12 @@ import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
 /* ========= PERFORMANCE / QUALITY ========= */
-const SEG_FPS   = 15;          // частота вычисления маски
+const SEG_FPS = 15;          // частота вычисления маски
 const SEG_SCALE = 0.5;         // масштаб входа для сегментации (0.4–0.6 оптимально)
-const USE_CONF  = !IS_IOS;     // на iOS category mask стабильнее
+const USE_CONF = !IS_IOS;     // на iOS category mask стабильнее
 const ACC = {
   thresh: IS_IOS ? 0.45 : 0.60,  // порог уверенности
-  gain:   IS_IOS ? 1.15 : 1.10,  // усиление вероятностей
+  gain: IS_IOS ? 1.15 : 1.10,  // усиление вероятностей
   emaAlpha: 0.25,                // EMA сглаживание маски
   blur: false,                   // доп. blur маски (ради FPS — off)
   rethresh: 0.50                 // повторный порог после blur
@@ -41,6 +41,45 @@ const els = {
   resetHSL: document.getElementById('resetHSL'),
 };
 
+// === Presets for SOLID mode ===
+const PRESET_COLORS = [
+  '#FFF4E5',
+  '#F9E5C8',
+  '#EED1A6',
+  '#DDB984',
+  '#C79E63',
+  '#AA8144',
+  '#886128',
+  '#604113',
+  '#332005'
+];
+
+// Render small color buttons into #presets
+function renderPresets() {
+  if (!els.presets) return;
+  els.presets.innerHTML = PRESET_COLORS.map(c => `
+    <button
+      type="button"
+      class="preset-chip"
+      data-color="${c}"
+      title="${c}"
+      aria-label="${c}"
+      style="
+        background:${c};
+        width:32px;height:32px;
+        border-radius:6px;
+        border:1px solid rgba(0,0,0,.12);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.3);
+        cursor:pointer;
+      "
+    ></button>
+  `).join('');
+}
+
+// вызвать один раз при загрузке
+renderPresets();
+
+
 const ctx = els.canvas.getContext('2d');
 let segmenter = null;
 let running = false;
@@ -58,9 +97,9 @@ let prevAlpha = null;      // Float32Array под EMA
 let drawRaf = 0;
 let segTimer = 0;
 
-function setStatus(t){ if (els.status) els.status.textContent = t ?? ''; }
-function clamp01(v){ return v < 0 ? 0 : v > 1 ? 1 : v; }
-function minmax(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function setStatus(t) { if (els.status) els.status.textContent = t ?? ''; }
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+function minmax(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 /* ================= INIT ================= */
 async function setupCamera() {
@@ -87,10 +126,10 @@ async function setupCamera() {
   els.canvas.width = vw;
   els.canvas.height = vh;
 
-  computeCanvas.width  = Math.max(64, Math.round(vw * SEG_SCALE));
+  computeCanvas.width = Math.max(64, Math.round(vw * SEG_SCALE));
   computeCanvas.height = Math.max(64, Math.round(vh * SEG_SCALE));
 
-  maskCanvas.width  = computeCanvas.width;
+  maskCanvas.width = computeCanvas.width;
   maskCanvas.height = computeCanvas.height;
 
   // дефолтная интенсивность
@@ -127,7 +166,7 @@ function alphaFromConfidenceMask(confMask) {
 
   const out = new Float32Array(f32.length);
   const t = ACC.thresh, g = ACC.gain;
-  for (let i=0; i<f32.length; i++){
+  for (let i = 0; i < f32.length; i++) {
     const v = clamp01(f32[i] * g);
     out[i] = v >= t ? v : 0;
   }
@@ -137,26 +176,26 @@ function alphaFromConfidenceMask(confMask) {
 function blurAndRethreshold(alpha, w, h, rethresh) {
   if (!ACC.blur) return alpha;
   const dst = new Float32Array(alpha.length);
-  for (let y=0; y<h; y++){
-    const y0 = y-1, y1 = y, y2 = y+1;
-    for (let x=0; x<w; x++){
-      const x0 = x-1, x1 = x, x2 = x+1;
+  for (let y = 0; y < h; y++) {
+    const y0 = y - 1, y1 = y, y2 = y + 1;
+    for (let x = 0; x < w; x++) {
+      const x0 = x - 1, x1 = x, x2 = x + 1;
       let sum = 0;
-      const p = (yy, xx) => (xx<0||yy<0||xx>=w||yy>=h) ? 0 : alpha[yy*w+xx];
-      sum += p(y0,x0)+p(y0,x1)+p(y0,x2)+p(y1,x0)+p(y1,x1)+p(y1,x2)+p(y2,x0)+p(y2,x1)+p(y2,x2);
+      const p = (yy, xx) => (xx < 0 || yy < 0 || xx >= w || yy >= h) ? 0 : alpha[yy * w + xx];
+      sum += p(y0, x0) + p(y0, x1) + p(y0, x2) + p(y1, x0) + p(y1, x1) + p(y1, x2) + p(y2, x0) + p(y2, x1) + p(y2, x2);
       const m = sum / 9;
-      dst[y*w + x] = (m >= rethresh) ? m : 0;
+      dst[y * w + x] = (m >= rethresh) ? m : 0;
     }
   }
   return dst;
 }
 
-function emaAlphaBlend(curr, prev, a){
+function emaAlphaBlend(curr, prev, a) {
   if (!prev || prev.length !== curr.length) return curr.slice();
   const out = new Float32Array(curr.length);
   const b = 1 - a;
-  for (let i=0; i<curr.length; i++){
-    out[i] = a*curr[i] + b*prev[i];
+  for (let i = 0; i < curr.length; i++) {
+    out[i] = a * curr[i] + b * prev[i];
   }
   return out;
 }
@@ -165,10 +204,10 @@ function alphaToMaskCanvas(alpha, w, h) {
   maskCanvas.width = w; maskCanvas.height = h;
   const id = maskCtx.createImageData(w, h);
   const data = id.data;
-  for (let i=0; i<alpha.length; i++){
-    const a = minmax(Math.round(alpha[i]*255), 0, 255);
-    const off = i*4;
-    data[off] = 255; data[off+1] = 255; data[off+2] = 255; data[off+3] = a;
+  for (let i = 0; i < alpha.length; i++) {
+    const a = minmax(Math.round(alpha[i] * 255), 0, 255);
+    const off = i * 4;
+    data[off] = 255; data[off + 1] = 255; data[off + 2] = 255; data[off + 3] = a;
   }
   maskCtx.putImageData(id, 0, 0);
   return maskCanvas; // возвращаем CANVAS (совместимо с iOS)
@@ -186,7 +225,7 @@ function applyHSLAdjustments(baseCanvas) {
 
   const light = parseInt(els.light?.value || "0", 10);
   if (light !== 0) {
-    tctx.globalAlpha = minmax(Math.abs(light)/100, 0, 1);
+    tctx.globalAlpha = minmax(Math.abs(light) / 100, 0, 1);
     tctx.globalCompositeOperation = (light > 0) ? 'screen' : 'multiply';
     tctx.fillStyle = (light > 0) ? '#ffffff' : '#000000';
     tctx.fillRect(0, 0, w, h);
@@ -195,25 +234,25 @@ function applyHSLAdjustments(baseCanvas) {
 
   const sat = parseInt(els.sat?.value || "0", 10);
   if (sat !== 0) {
-    const img = tctx.getImageData(0,0,w,h);
+    const img = tctx.getImageData(0, 0, w, h);
     const data = img.data;
     if (sat < 0) {
       const k = (100 - Math.min(100, Math.abs(sat))) / 100;
-      for (let i=0; i<data.length; i+=4) {
-        const r = data[i], g = data[i+1], b = data[i+2];
-        const gray = 0.2126*r + 0.7152*g + 0.0722*b;
-        data[i]   = gray + (r - gray)*k;
-        data[i+1] = gray + (g - gray)*k;
-        data[i+2] = gray + (b - gray)*k;
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const gray = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        data[i] = gray + (r - gray) * k;
+        data[i + 1] = gray + (g - gray) * k;
+        data[i + 2] = gray + (b - gray) * k;
       }
     } else {
-      const boost = 1 + (sat/100);
-      for (let i=0; i<data.length; i+=4) {
-        const r = data[i], g = data[i+1], b = data[i+2];
-        const gray = 0.2126*r + 0.7152*g + 0.0722*b;
-        data[i]   = gray + (r - gray)*boost;
-        data[i+1] = gray + (g - gray)*boost;
-        data[i+2] = gray + (b - gray)*boost;
+      const boost = 1 + (sat / 100);
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const gray = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        data[i] = gray + (r - gray) * boost;
+        data[i + 1] = gray + (g - gray) * boost;
+        data[i + 2] = gray + (b - gray) * boost;
       }
     }
     tctx.putImageData(img, 0, 0);
@@ -257,7 +296,7 @@ function drawCompositeWithMask(maskCanv) {
     const top = els.topColor.value || '#f5d08b';
     const bottom = els.bottomColor.value || '#8e44ad';
     const shift = parseFloat(els.gradientShift.value || "0");
-    const grad = tctx.createLinearGradient(0, h*(0.2+shift), 0, h*(0.8+shift));
+    const grad = tctx.createLinearGradient(0, h * (0.2 + shift), 0, h * (0.8 + shift));
     grad.addColorStop(0, top);
     grad.addColorStop(1, bottom);
     tctx.fillStyle = grad;
@@ -285,7 +324,7 @@ function drawLoop() {
   if (!running) return;
   if (lastMaskCanvas) {
     drawCompositeWithMask(lastMaskCanvas);
-    setStatus('Работает)');
+    setStatus('Работает');
   } else {
     // первая маска ещё не пришла — показываем видео
     ctx.globalCompositeOperation = 'source-over';
@@ -315,8 +354,8 @@ async function segStep() {
       let mh = cat.height ?? cat.rows ?? cat.shape?.[0];
       let src = cat.getAsUint8Array ? cat.getAsUint8Array() : cat.data;
       if (!mw || !mh) { mw = w; mh = h; }
-      const a = new Float32Array(mw*mh);
-      for (let i=0; i<mw*mh; i++) a[i] = (src[i] === 1) ? 1 : 0;
+      const a = new Float32Array(mw * mh);
+      for (let i = 0; i < mw * mh; i++) a[i] = (src[i] === 1) ? 1 : 0;
       alpha = a; w = mw; h = mh;
     }
 
