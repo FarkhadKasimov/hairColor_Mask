@@ -57,10 +57,10 @@ const PRESET_COLORS = [
 // Render small color buttons into #presets
 function renderPresets() {
   if (!els.presets) return;
-  els.presets.innerHTML = PRESET_COLORS.map(c => `
+  els.presets.innerHTML = PRESET_COLORS.map((c, i) => `
     <button
       type="button"
-      class="preset-chip"
+      class="preset-chip${i===0 ? ' selected' : ''}"
       data-color="${c}"
       title="${c}"
       aria-label="${c}"
@@ -79,10 +79,24 @@ function renderPresets() {
 // вызвать один раз при загрузке
 renderPresets();
 
-// установить первый цвет по умолчанию
+// дефолтный выбор — первый цвет
 if (PRESET_COLORS.length > 0 && els.solidColor) {
   els.solidColor.value = PRESET_COLORS[0];
 }
+
+// Обработчик кликов
+els.presets?.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-color]');
+  if (btn) {
+    els.solidColor.value = btn.dataset.color;
+
+    // убрать выделение со всех
+    els.presets.querySelectorAll('.preset-chip').forEach(b => b.classList.remove('selected'));
+    // подсветить выбранный
+    btn.classList.add('selected');
+  }
+});
+
 
 const ctx = els.canvas.getContext('2d');
 let segmenter = null;
