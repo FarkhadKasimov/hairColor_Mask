@@ -1,18 +1,21 @@
-// Hair Color Demo — iOS-safe, dual loop + downscale segmentation (no ImageBitmap)
+// Hair Color Demo — iOS-safe, fast (dual loop + downscale segmentation)
 import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.2";
 
-/* ========= PERFORMANCE TUNING ========= */
-const SEG_FPS   = 15;     // how often to run segmentation
-const SEG_SCALE = 0.5;    // compute resolution scale (0.4–0.6 good)
-const USE_CONF  = true;   // use confidence mask if available
+/* ========= DETECT iOS ========= */
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+/* ========= PERFORMANCE / QUALITY ========= */
+const SEG_FPS   = 15;          // частота вычисления маски
+const SEG_SCALE = 0.5;         // масштаб входа для сегментации (0.4–0.6 оптимально)
+const USE_CONF  = !IS_IOS;     // на iOS category mask стабильнее
 const ACC = {
-  thresh: 0.60,
-  gain: 1.10,
-  emaAlpha: 0.25,
-  blur: false,
-  rethresh: 0.50
+  thresh: IS_IOS ? 0.45 : 0.60,  // порог уверенности
+  gain:   IS_IOS ? 1.15 : 1.10,  // усиление вероятностей
+  emaAlpha: 0.25,                // EMA сглаживание маски
+  blur: false,                   // доп. blur маски (ради FPS — off)
+  rethresh: 0.50                 // повторный порог после blur
 };
-/* ===================================== */
+/* ======================================== */
 
 const els = {
   start: document.getElementById('startBtn'),
@@ -42,17 +45,15 @@ const ctx = els.canvas.getContext('2d');
 let segmenter = null;
 let running = false;
 
-// compute-size canvas (downscaled input for segmentation)
+// downscaled canvas для сегментации
 const computeCanvas = document.createElement('canvas');
 const computeCtx = computeCanvas.getContext('2d', { willReadFrequently: true });
 
-// RGBA mask canvas in compute resolution (iOS-safe storage)
+// RGBA-маска хранится в canvas (iOS-safe)
 const maskCanvas = document.createElement('canvas');
 const maskCtx = maskCanvas.getContext('2d');
-
-// last ready mask (we keep as CANVAS, not ImageBitmap)
-let lastMaskCanvas = null;
-let prevAlpha = null;
+let lastMaskCanvas = null; // ссылка на актуальную маску (canvas)
+let prevAlpha = null;      // Float32Array под EMA
 
 let drawRaf = 0;
 let segTimer = 0;
@@ -61,9 +62,9 @@ function setStatus(t){ if (els.status) els.status.textContent = t ?? ''; }
 function clamp01(v){ return v < 0 ? 0 : v > 1 ? 1 : v; }
 function minmax(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
-/* ============ INIT ============ */
+/* ================= INIT ================= */
 async function setupCamera() {
-  // iOS requirements
+  // важно для iOS
   els.video.setAttribute('playsinline', '');
   els.video.playsInline = true;
   els.video.muted = true;
@@ -86,13 +87,14 @@ async function setupCamera() {
   els.canvas.width = vw;
   els.canvas.height = vh;
 
-  computeCanvas.width = Math.max(64, Math.round(vw * SEG_SCALE));
+  computeCanvas.width  = Math.max(64, Math.round(vw * SEG_SCALE));
   computeCanvas.height = Math.max(64, Math.round(vh * SEG_SCALE));
 
-  maskCanvas.width = computeCanvas.width;
+  maskCanvas.width  = computeCanvas.width;
   maskCanvas.height = computeCanvas.height;
 
-  if (els.strength) els.strength.value = "0.3"; // default intensity
+  // дефолтная интенсивность
+  if (els.strength) els.strength.value = "0.3";
 
   setStatus(`Камера: ${vw}×${vh}, seg: ${computeCanvas.width}×${computeCanvas.height}`);
   ctx.drawImage(els.video, 0, 0, vw, vh);
@@ -114,7 +116,7 @@ async function initSegmenter() {
   setStatus('Модель загружена');
 }
 
-/* ======== MASK POSTPROCESS ======== */
+/* ============== MASK UTILS ============== */
 function alphaFromConfidenceMask(confMask) {
   const w = confMask.width ?? confMask.cols ?? confMask.shape?.[1];
   const h = confMask.height ?? confMask.rows ?? confMask.shape?.[0];
@@ -169,10 +171,10 @@ function alphaToMaskCanvas(alpha, w, h) {
     data[off] = 255; data[off+1] = 255; data[off+2] = 255; data[off+3] = a;
   }
   maskCtx.putImageData(id, 0, 0);
-  return maskCanvas; // return CANVAS (iOS-safe)
+  return maskCanvas; // возвращаем CANVAS (совместимо с iOS)
 }
 
-/* ============ RENDER ============ */
+/* ============== RENDER HELPERS ============== */
 function applyHSLAdjustments(baseCanvas) {
   const w = els.canvas.width;
   const h = els.canvas.height;
@@ -220,15 +222,30 @@ function applyHSLAdjustments(baseCanvas) {
   return tmp;
 }
 
+/* ====== iOS-safe композитинг с маской ======
+   Шаги:
+   1) рисуем видео на основном ctx
+   2) "вырезаем" волосы на основном ctx через destination-in с маской
+   3) рисуем цвет во внутрь этой области через source-atop
+   4) добавляем текстуру волос (soft-light)
+   5) применяем HSL
+*/
 function drawCompositeWithMask(maskCanv) {
   const w = els.canvas.width, h = els.canvas.height;
 
-  // 1) Base video
+  // 1) База — видео
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   ctx.drawImage(els.video, 0, 0, w, h);
 
-  // 2) Color layer
+  // 2) Маска на основной контекст
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  // "Feather": используем upscale маски + сглаживание
+  ctx.drawImage(maskCanv, 0, 0, w, h);
+
+  // 3) Цветовой слой внутри маски — через source-atop
   const tmp = document.createElement('canvas');
   tmp.width = w; tmp.height = h;
   const tctx = tmp.getContext('2d');
@@ -247,36 +264,30 @@ function drawCompositeWithMask(maskCanv) {
   }
   tctx.fillRect(0, 0, w, h);
 
-  // 3) Apply mask (upscale from compute res)
-  tctx.globalCompositeOperation = 'destination-in';
-  tctx.imageSmoothingEnabled = true;
-  tctx.imageSmoothingQuality = 'high';
-  tctx.drawImage(maskCanv, 0, 0, w, h);
+  ctx.globalCompositeOperation = 'source-atop';
+  ctx.globalAlpha = minmax(parseFloat(els.strength.value || "0.3"), 0, 1);
+  ctx.drawImage(tmp, 0, 0, w, h);
 
-  // 4) Intensity
-  const strength = parseFloat(els.strength.value || "0.3");
-  ctx.globalAlpha = minmax(strength, 0, 1);
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.drawImage(tctx.canvas, 0, 0, w, h);
-
-  // 5) Preserve hair texture
+  // 4) Текстура волос
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'soft-light';
   ctx.drawImage(els.video, 0, 0, w, h);
 
-  // 6) HSL adjustments
+  // 5) HSL-коррекция
   ctx.globalCompositeOperation = 'source-over';
   const adjusted = applyHSLAdjustments(els.canvas);
   ctx.drawImage(adjusted, 0, 0);
 }
 
-/* ===== DRAW LOOP (60 FPS) ===== */
+/* ============== LOOPS ============== */
+// Быстрый цикл отрисовки (каждый кадр): рисуем видео + последнюю маску
 function drawLoop() {
   if (!running) return;
   if (lastMaskCanvas) {
     drawCompositeWithMask(lastMaskCanvas);
     setStatus('Работает ✔ (iOS-safe)');
   } else {
+    // первая маска ещё не пришла — показываем видео
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
     ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
@@ -285,17 +296,18 @@ function drawLoop() {
   drawRaf = requestAnimationFrame(drawLoop);
 }
 
-/* ===== SEGMENTATION LOOP (SEG_FPS) ===== */
+// Медленный цикл сегментации
 async function segStep() {
   if (!running) return;
   try {
+    // подаём уменьшенный кадр в сегментацию
     computeCtx.drawImage(els.video, 0, 0, computeCanvas.width, computeCanvas.height);
     const res = await segmenter.segmentForVideo(computeCanvas, performance.now());
 
     let alpha = null, w = computeCanvas.width, h = computeCanvas.height;
 
     if (USE_CONF && res?.confidenceMasks?.[1]) {
-      const got = alphaFromConfidenceMask(res.confidenceMasks[1]);
+      const got = alphaFromConfidenceMask(res.confidenceMasks[1]); // hair = 1
       alpha = got.alpha; w = got.w; h = got.h;
     } else if (res?.categoryMask) {
       const cat = res.categoryMask;
@@ -313,7 +325,7 @@ async function segStep() {
       prevAlpha = alpha;
       if (ACC.blur) alpha = blurAndRethreshold(alpha, w, h, ACC.rethresh);
 
-      // build mask CANVAS (iOS-safe) and store it
+      // готовим CANVAS-маску и запоминаем
       lastMaskCanvas = alphaToMaskCanvas(alpha, w, h);
     }
   } catch (e) {
@@ -321,7 +333,7 @@ async function segStep() {
   }
 }
 
-/* --------- UI --------- */
+/* ============== UI BINDINGS ============== */
 els.start.addEventListener('click', async () => {
   try {
     if (!segmenter) await initSegmenter();
@@ -378,7 +390,7 @@ els.resetHSL.addEventListener('click', () => {
   els.light.value = 0;
 });
 
-// (опционально) подчистка на выгрузке страницы в iOS
+// на iOS полезно останавливать циклы при выгрузке
 window.addEventListener('pagehide', () => {
   running = false;
   drawRaf && cancelAnimationFrame(drawRaf);
